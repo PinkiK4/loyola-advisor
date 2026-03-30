@@ -6,9 +6,9 @@ import os
 import base64
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Loyola Advisor", layout="wide", page_icon="🎓")
+st.set_page_config(page_title="Loyola AI Advisor", layout="wide", page_icon="🎓")
 
-# --- CUSTOM CSS: SEAL OVERLAY & GLASSMORPHISM ---
+# --- CUSTOM CSS: BACKGROUND & OVERLAYS ---
 def get_base64(bin_file):
     with open(bin_file, 'rb') as f:
         return base64.b64encode(f.read()).decode()
@@ -33,7 +33,6 @@ def set_style(img_file):
         [data-testid="stSidebar"] {{
             background-color: rgba(15, 15, 15, 0.98) !important;
             border-right: 3px solid #006838 !important;
-            z-index: 100; /* Keeps sidebar below the seal overlay */
         }}
         h1 {{ color: #006838 !important; font-weight: 800 !important; }}
         [data-testid="stMetric"] {{ 
@@ -53,15 +52,6 @@ def set_style(img_file):
             font-weight: 500;
             z-index: 1000;
         }}
-        /* THE CRITICAL FIX: Higher Z-Index and Right-Offset */
-        .bottom-left-seal {{
-            position: fixed;
-            left: 350px; /* Moves it out from behind the sidebar */
-            bottom: 30px;
-            z-index: 999999 !important; /* Forces it to the very top */
-            filter: drop-shadow(0px 6px 12px rgba(0,0,0,0.9));
-            pointer-events: none;
-        }}
         </style>
         ''', unsafe_allow_html=True)
 
@@ -77,7 +67,7 @@ def extract_data(files):
     q = re.search(r"Cumulative (?:GPA|QPA):\s+(\d\.\d{3})", text)
     return (int(c.group(1)) if c else 126, q.group(1) if q else "3.548")
 
-# --- SIDEBAR ---
+# --- SIDEBAR (ALIGNED LAYOUT) ---
 with st.sidebar:
     st.header("📂 Document Center")
     uploaded_files = st.file_uploader("Upload Audit PDFs", type="pdf", accept_multiple_files=True)
@@ -88,9 +78,14 @@ with st.sidebar:
         st.progress(min(earned_val / 120, 1.0))
     st.markdown("---")
     st.caption("Instructions: Drag and drop your Loyola Degree Audit to update your metrics.")
+    
+    # SEAL POSITIONED AT THE BOTTOM OF THE SIDEBAR
+    if os.path.exists("LoyolaSeal.png"):
+        st.image("LoyolaSeal.png", use_container_width=True)
 
 # --- MAIN UI ---
-st.title("🎓 Loyola Data Science Advisor")
+st.title("🎓 Loyola AI Schedule Advisor")
+
 if uploaded_files:
     if float(qpa_val) >= 3.5:
         st.success(f"### 🎉 Honors Candidate: {qpa_val} QPA")
@@ -105,10 +100,5 @@ if uploaded_files:
         st.checkbox("GPA > 2.0", value=(float(qpa_val) >= 2.0))
 else:
     st.info("Awaiting document upload to sync your profile.")
-
-# --- SEAL & FOOTER OVERLAYS ---
-if os.path.exists("LoyolaSeal.png"):
-    seal_base64 = get_base64("LoyolaSeal.png")
-    st.markdown(f'<div class="bottom-left-seal"><img src="data:image/png;base64,{seal_base64}" width="150"></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
