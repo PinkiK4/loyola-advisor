@@ -138,3 +138,4 @@ if uploaded_files:
         st.progress(min(data['earned'] / 120, 1.0))
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
+# Version 2.0 - Final Multi-Major
