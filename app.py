@@ -8,16 +8,14 @@ import base64
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Loyola Advisor", layout="wide", page_icon="🎓")
 
-# --- BACKGROUND IMAGE INJECTOR ---
+# --- BACKGROUND & POSITIONING CSS ---
 def get_base64(bin_file):
     with open(bin_file, 'rb') as f:
-        data = f.read()
-    return base64.b64encode(data).decode()
+        return base64.b64encode(f.read()).decode()
 
-def set_bg(img_file):
-    if os.path.exists(img_file):
-        bin_str = get_base64(img_file)
-        page_bg_img = f'''
+def set_style(img_file):
+    bin_str = get_base64(img_file) if os.path.exists(img_file) else ""
+    st.markdown(f'''
         <style>
         .stApp {{
             background-image: url("data:image/jpeg;base64,{bin_str}");
@@ -25,7 +23,6 @@ def set_bg(img_file):
             background-position: center;
             background-attachment: fixed;
         }}
-        /* Overlay to make content readable */
         .stApp > div {{
             background-color: rgba(0, 0, 0, 0.8) !important;
             padding: 2rem;
@@ -33,13 +30,30 @@ def set_bg(img_file):
         }}
         h1 {{ color: #006838 !important; font-weight: 800 !important; }}
         [data-testid="stMetric"] {{ background-color: #1e1e1e !important; border-left: 5px solid #006838 !important; }}
-        thead tr th {{ background-color: #006838 !important; color: white !important; }}
+        
+        /* Fixed Bottom Attribution */
+        .footer {{
+            position: fixed;
+            left: 0;
+            bottom: 10px;
+            width: 100%;
+            text-align: center;
+            color: #888888;
+            font-size: 14px;
+            z-index: 100;
+        }}
+        
+        /* Fixed Bottom-Left Seal */
+        .bottom-left-seal {{
+            position: fixed;
+            left: 20px;
+            bottom: 40px;
+            z-index: 99;
+        }}
         </style>
-        '''
-        st.markdown(page_bg_img, unsafe_allow_html=True)
+        ''', unsafe_allow_html=True)
 
-# Call the background function
-set_bg("Background.jpeg")
+set_style("Background.jpeg")
 
 # --- DATA LOGIC ---
 def extract_data(files):
@@ -51,10 +65,8 @@ def extract_data(files):
     q = re.search(r"Cumulative (?:GPA|QPA):\s+(\d\.\d{3})", text)
     return (int(c.group(1)) if c else 126, q.group(1) if q else "3.548")
 
-# --- SIDEBAR ---
+# --- SIDEBAR (Seal Removed from here) ---
 with st.sidebar:
-    if os.path.exists("LoyolaSeal.png"):
-        st.image("LoyolaSeal.png", width=150)
     st.header("📂 Document Center")
     uploaded_files = st.file_uploader("Upload Audit PDFs", type="pdf", accept_multiple_files=True)
     if uploaded_files:
@@ -69,6 +81,7 @@ st.title("🎓 Loyola Data Science Advisor")
 if uploaded_files:
     if float(qpa_val) >= 3.5:
         st.success(f"### 🎉 Honors Candidate: {qpa_val} QPA")
+    
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("📅 Recommended Spring 2026 Schedule")
@@ -81,5 +94,15 @@ if uploaded_files:
 else:
     st.warning("Awaiting document upload...")
 
-st.markdown("---")
-st.caption("Built by Krishon Pinkins | Loyola University Maryland 2026")
+# --- POSITIONED ELEMENTS ---
+# 1. Seal at bottom left
+if os.path.exists("LoyolaSeal.png"):
+    seal_base64 = get_base64("LoyolaSeal.png")
+    st.markdown(f'''
+        <div class="bottom-left-seal">
+            <img src="data:image/png;base64,{seal_base64}" width="120">
+        </div>
+    ''', unsafe_allow_html=True)
+
+# 2. Attribution at absolute bottom
+st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
