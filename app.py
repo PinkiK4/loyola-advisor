@@ -41,84 +41,107 @@ def set_style(img_file):
 
 set_style("Background.jpeg")
 
-# --- 2. EXTRACTION & GRADUATION LOGIC ---
-def analyze_graduation(audit_file, transcript_file):
+# --- 2. ENGINES ---
+def create_pdf(data, schedule_df):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, f"AI Automated Scheduling: {data['major']}", ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", size=11)
+    pdf.cell(100, 8, f"Student: {data['name']} | ID: {data['sid']}", ln=1)
+    pdf.cell(100, 8, f"Cumulative GPA: {data['qpa']}", ln=1)
+    pdf.ln(10)
+    pdf.set_font("Arial", 'B', 11)
+    pdf.cell(40, 10, "ID", 1); pdf.cell(100, 10, "Course", 1); pdf.cell(30, 10, "Credits", 1); pdf.ln()
+    pdf.set_font("Arial", size=10)
+    for _, row in schedule_df.iterrows():
+        pdf.cell(40, 10, str(row['Course ID']), 1); pdf.cell(100, 10, str(row['Course Name']), 1); pdf.cell(30, 10, str(row['Credits']), 1); pdf.ln()
+    return pdf.output(dest='S').encode('latin-1')
+
+# --- 3. DYNAMIC ANALYSIS ENGINE ---
+def analyze_data(audit_file, transcript_file):
     a_text, t_text = "", ""
     with pdfplumber.open(audit_file) as pdf:
         a_text = "".join([p.extract_text() or "" for p in pdf.pages])
     with pdfplumber.open(transcript_file) as pdf:
         t_text = "".join([p.extract_text() or "" for p in pdf.pages])
     
-    # Scrapers for Identity and GPA
+    # Scrapers
     name = re.search(r"Name:\s+([A-Za-z\s,]+)", t_text)
     sid = re.search(r"I\.D\.No\.:\s+(\d+)", t_text)
     major = re.search(r"Major:\s+([A-Za-z\s]+)", t_text)
     qpa = re.search(r"Total\s+CA:.*?QPA:.*?(\d\.\d{3})", t_text, re.DOTALL | re.IGNORECASE)
-    credits = re.search(r"Total\s+CA:.*?CE:\s+(\d+\.\d+)", t_text, re.DOTALL)
     
-    # CIP Logic for Graduation Only
-    # This finds courses marked 'CIP' to prevent early graduation screen
-    cip_courses = re.findall(r"([A-Z]{2}\s\d{3})\s.*?\sCIP", t_text)
+    # CREDIT LOGIC: Count Earned + CIP credits toward graduation goal
+    earned_credits = re.search(r"Total\s+CA:.*?CE:\s+(\d+\.\d+)", t_text, re.DOTALL)
+    current_val = float(earned_credits.group(1)) if earned_credits else 0.0
     
-    # Logic for Recommended Schedule (Ignores CIP)
-    taken_codes = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
+    cip_matches = re.findall(r"([A-Z]{2}\s\d{3})\s+(.*?)\s+(\d\.\d{2})\s+CIP", t_text)
+    cip_credits = sum(float(m[2]) for m in cip_matches)
+    total_projected_credits = current_val + cip_credits
+
+    # RECOMMENDATION LOGIC: Exclude anything already on transcript (Completed OR CIP)
+    taken_or_cip = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
     audit_reqs = re.findall(r"([A-Z]{2}\s\d{3})\s+([A-Za-z&\s]+?)\s+\d\.\d", a_text)
     
-    recommendations = []
+    recs = []
     seen = set()
     for code, title in audit_reqs:
-        if code not in taken_codes and code not in seen:
-            recommendations.append({"Course ID": code, "Course Name": title.strip(), "Credits": 3.0})
+        if code not in taken_or_cip and code not in seen:
+            recs.append({"Course ID": code, "Course Name": title.strip(), "Credits": 3.0})
             seen.add(code)
             
     return {
-        "name": name.group(1).strip() if name else "Krishon Pinkins",
-        "sid": sid.group(1) if sid else "1938622",
-        "major": major.group(1).strip() if major else "Data Science",
-        "qpa": qpa.group(1) if qpa else "3.461",
-        "earned": float(credits.group(1)) if credits else 81.0,
-        "is_cip_active": len(cip_courses) > 0,
-        "recommendations": pd.DataFrame(recommendations)
+        "name": name.group(1).strip() if name else "Student",
+        "sid": sid.group(1) if sid else "0000000",
+        "major": major.group(1).strip() if major else "Major",
+        "qpa": qpa.group(1) if qpa else "0.000",
+        "total_credits": total_projected_credits,
+        "is_cip_active": len(cip_matches) > 0,
+        "recs": pd.DataFrame(recs)
     }
 
-# --- 3. SIDEBAR ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("📂 Document Center")
-    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf", key="aud_final")
-    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_final")
+    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf", key="aud_vFinal")
+    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_vFinal")
     st.markdown("---")
     st.markdown("### 📝 Instructions")
-    st.info("The AI will identify outstanding requirements. Graduation rewards are locked until all 'CIP' courses are finalized.")
+    st.info("CIP credits count toward your 120-credit goal, but the graduation screen triggers only after final grades post.")
     if os.path.exists("LoyolaSeal.png"):
         st.image("LoyolaSeal.png", use_container_width=True)
 
-# --- 4. MAIN UI ---
+# --- 5. MAIN UI ---
 if a_f and t_f:
-    data = analyze_graduation(a_f, t_f)
+    data = analyze_data(a_f, t_f)
     
-    # CONGRATS LOGIC: Only triggers if NO recommendations AND NO CIP courses remain
-    if data['recommendations'].empty and not data['is_cip_active'] and data['earned'] >= 120:
+    # Graduation Condition: No missing reqs AND no CIP active AND 120+ credits
+    if data['recs'].empty and not data['is_cip_active'] and data['total_credits'] >= 120:
         st.markdown(f'''<div class="congrats-card"><h1 style="color: gold !important;">🎉 DEGREE CONFERRED 🎉</h1>
-        <h2 style="color: white;">{data['name']}</h2><p style="color: #ddd;">BS in {data['major']} Complete.</p>
+        <h2 style="color: white;">{data['name']}</h2><p style="color: #ddd;">BS in {data['major']} Conferred.</p>
         <h3 style="color: #00ff88;">Final QPA: {data['qpa']}</h3></div>''', unsafe_allow_html=True)
         st.balloons()
     else:
-        st.title(f"🎓 Loyola AI {data['major']} Advisor")
-        st.info(f"🚀 **Career Target:** Data Scientist | **Verified QPA:** {data['qpa']}")
+        st.title(f"🎓 AI Automated Course Scheduling: {data['major']}")
+        st.info(f"🚀 **Career Alignment:** Data Scientist | **Market Target:** Tech & Gov-Tech")
+        st.success(f"✅ Verified: {data['name']} | ID: {data['sid']} | GPA: {data['qpa']}")
         
         col1, col2 = st.columns([2, 1])
         with col1:
             st.subheader("📅 Recommended Next Steps")
-            if not data['recommendations'].empty:
-                st.write("The following items are missing from your academic history:")
-                st.table(data['recommendations'])
+            if not data['recs'].empty:
+                st.table(data['recs'])
+                pdf_bytes = create_pdf(data, data['recs'])
+                st.download_button("📥 Download Official Schedule Advice", data=pdf_bytes, file_name="Loyola_Advice.pdf")
             else:
-                st.success("All specific audit requirements found! Ensure all 'CIP' courses finish and total credits reach 120.")
+                st.info("All audit requirements accounted for. Waiting for CIP grades to post for graduation.")
         
         with col2:
             st.subheader("📝 Summary")
-            st.metric("Earned Credits", f"{data['earned']} / 120")
-            st.write(f"**Status:** {'Awaiting CIP Completion' if data['is_cip_active'] else 'On Track'}")
-            st.progress(min(data['earned']/120, 1.0))
+            st.metric("Projected Total Credits", f"{data['total_credits']} / 120")
+            st.write(f"**CIP Status:** {'In Progress' if data['is_cip_active'] else 'None'}")
+            st.progress(min(data['total_credits']/120, 1.0))
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
