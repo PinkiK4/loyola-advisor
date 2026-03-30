@@ -67,13 +67,11 @@ def analyze_data(audit_file, transcript_file):
     with pdfplumber.open(transcript_file) as pdf:
         t_text = "".join([p.extract_text() or "" for p in pdf.pages])
     
-    # Scrapers
     name = re.search(r"Name:\s+([A-Za-z\s,]+)", t_text)
     sid = re.search(r"I\.D\.No\.:\s+(\d+)", t_text)
     major = re.search(r"Major:\s+([A-Za-z\s]+)", t_text)
     qpa = re.search(r"Total\s+CA:.*?QPA:.*?(\d\.\d{3})", t_text, re.DOTALL | re.IGNORECASE)
     
-    # CREDIT LOGIC: Count Earned + CIP credits toward graduation goal
     earned_credits = re.search(r"Total\s+CA:.*?CE:\s+(\d+\.\d+)", t_text, re.DOTALL)
     current_val = float(earned_credits.group(1)) if earned_credits else 0.0
     
@@ -81,7 +79,6 @@ def analyze_data(audit_file, transcript_file):
     cip_credits = sum(float(m[2]) for m in cip_matches)
     total_projected_credits = current_val + cip_credits
 
-    # RECOMMENDATION LOGIC: Exclude anything already on transcript (Completed OR CIP)
     taken_or_cip = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
     audit_reqs = re.findall(r"([A-Z]{2}\s\d{3})\s+([A-Za-z&\s]+?)\s+\d\.\d", a_text)
     
@@ -109,7 +106,7 @@ with st.sidebar:
     t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_vFinal")
     st.markdown("---")
     st.markdown("### 📝 Instructions")
-    st.info("CIP credits count toward your 120-credit goal, but the graduation screen triggers only after final grades post.")
+    st.info("CIP credits count toward your 120-credit goal. Graduation is locked until final grades post.")
     if os.path.exists("LoyolaSeal.png"):
         st.image("LoyolaSeal.png", use_container_width=True)
 
@@ -117,7 +114,6 @@ with st.sidebar:
 if a_f and t_f:
     data = analyze_data(a_f, t_f)
     
-    # Graduation Condition: No missing reqs AND no CIP active AND 120+ credits
     if data['recs'].empty and not data['is_cip_active'] and data['total_credits'] >= 120:
         st.markdown(f'''<div class="congrats-card"><h1 style="color: gold !important;">🎉 DEGREE CONFERRED 🎉</h1>
         <h2 style="color: white;">{data['name']}</h2><p style="color: #ddd;">BS in {data['major']} Conferred.</p>
@@ -143,5 +139,9 @@ if a_f and t_f:
             st.metric("Projected Total Credits", f"{data['total_credits']} / 120")
             st.write(f"**CIP Status:** {'In Progress' if data['is_cip_active'] else 'None'}")
             st.progress(min(data['total_credits']/120, 1.0))
+else:
+    # RESTORED INITIAL STATE
+    st.title("🎓 Loyola AI Schedule Advisor")
+    st.warning("⚠️ Awaiting File Upload: Please upload your **Degree Audit** and **Transcript** in the sidebar to activate analysis.")
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
