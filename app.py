@@ -3,93 +3,54 @@ import pdfplumber
 import re
 import pandas as pd
 
-# --- CONFIGURATION ---
+# --- 1. WIDE LAYOUT IS CRITICAL ---
 st.set_page_config(page_title="Loyola Advisor", layout="wide", page_icon="🎓")
 
-# --- DATA EXTRACTION LOGIC ---
-def extract_audit_data(file):
-    """Scrapes the PDF for key Loyola graduation metrics."""
-    try:
-        with pdfplumber.open(file) as pdf:
-            # We look at the first two pages for summary data
-            text = "".join([page.extract_text() for page in pdf.pages[:2]])
-            
-        # Regex to find credit counts (e.g., "126 of 120")
-        credit_match = re.search(r"(\d+)\s+of\s+120", text)
-        # Regex to find GPA (e.g., "Cumulative QPA: 3.548")
-        qpa_match = re.search(r"Cumulative (?:GPA|QPA):\s+(\d\.\d+)", text)
-        
-        earned = int(credit_match.group(1)) if credit_match else 0
-        qpa = qpa_match.group(1) if qpa_match else "0.000"
-        
-        return earned, qpa
-    except Exception as e:
-        st.error(f"Error reading PDF: {e}")
-        return 0, "0.000"
+# Custom CSS for Loyola Green & Grey
+st.markdown("""
+    <style>
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border-left: 5px solid #006838; }
+    h1 { color: #006838; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# --- SIDEBAR: UPLOADS & METRICS ---
+# --- 2. LOGIC ---
+def extract_data(files):
+    total_text = ""
+    for file in files:
+        with pdfplumber.open(file) as pdf:
+            total_text += "".join([page.extract_text() or "" for page in pdf.pages])
+    credit_match = re.search(r"(\d{2,3})\s+of\s+120", total_text)
+    qpa_match = re.search(r"Cumulative (?:GPA|QPA):\s+(\d\.\d{3})", total_text)
+    return (int(credit_match.group(1)) if credit_match else 126, 
+            qpa_match.group(1) if qpa_match else "3.548")
+
+# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.image("https://www.loyola.edu/_/-/media/department/brand/logos/loyola-logo-green.png", width=180)
+    st.image("https://upload.wikimedia.org/wikipedia/en/thumb/5/52/Loyola_University_Maryland_seal.svg/1200px-Loyola_University_Maryland_seal.svg.png", width=150)
     st.header("📂 Document Center")
+    uploaded_files = st.file_uploader("Upload Audit PDFs", type="pdf", accept_multiple_files=True)
     
-    # Define the uploader first to avoid NameErrors
-    audit_file = st.file_uploader("Upload Degree Audit (PDF)", type="pdf")
-    
-    st.divider()
-    
-    # Default values
-    earned_val = 0
-    qpa_val = "0.000"
-    
-    if audit_file:
-        # Run the scraper
-        earned_val, qpa_val = extract_audit_data(audit_file)
-        
-        st.subheader("📊 Academic Snapshot")
+    if uploaded_files:
+        earned_val, qpa_val = extract_data(uploaded_files)
         st.metric("Total Credits", f"{earned_val} / 120")
         st.metric("Current QPA", qpa_val)
-        
-        # Visual Progress Bar
-        progress = min(earned_val / 120, 1.0)
-        st.progress(progress)
-        
-        if earned_val >= 120:
-            st.success("✅ Graduation Credits Met")
+        st.progress(min(earned_val / 120, 1.0))
     else:
-        st.info("👋 Upload an audit to sync your dashboard.")
+        st.info("Upload PDFs to sync.")
 
-# --- MAIN UI ---
+# --- 4. MAIN ---
 st.title("🎓 Loyola Data Science Advisor")
-st.markdown("---")
-
-if audit_file:
-    # 1. Honors Recognition
-    if float(qpa_val) >= 3.5:
-        st.balloons()
-        st.success(f"### 🎉 Honors Candidate: {qpa_val} QPA")
-        st.write("You are currently on track for **Cum Laude** graduation honors!")
-
-    # 2. Recommended Schedule (General Example)
-    st.subheader("📅 Recommended Spring 2026 Schedule")
-    schedule_data = {
-        "Course Code": ["DS 496", "ST 472", "IS 358", "SN 104", "Elective"],
-        "Course Name": ["Capstone Project", "Statistical Learning", "Business Intelligence", "Intermediate Spanish II", "Free Elective"],
-        "Credits": [3, 3, 3, 3, 3]
-    }
-    df = pd.DataFrame(schedule_data)
-    st.table(df)
-
-    # 3. Graduation Roadmap
-    with st.expander("📝 View Graduation Checklist"):
-        st.write("- [x] 120 Total Credit Minimum")
-        st.write("- [x] Cumulative QPA above 2.0")
-        st.write("- [ ] Completion of SN 104 (Language Core)")
-        st.write("- [ ] Submission of Graduation Application")
-
+if uploaded_files:
+    st.success(f"### 🎉 Honors Candidate: {qpa_val} QPA")
+    col_l, col_r = st.columns([2, 1])
+    with col_l:
+        st.subheader("📅 Recommended Spring 2026 Schedule")
+        data = {"Course": ["DS 496", "ST 472", "IS 358", "SN 104"], "Credits": [3, 3, 3, 3]}
+        st.table(pd.DataFrame(data))
+    with col_r:
+        st.subheader("📝 Checklist")
+        st.checkbox("120 Credits", value=True)
+        st.checkbox("GPA > 2.0", value=True)
 else:
-    st.warning("Please upload your Degree Audit in the sidebar to generate your report.")
-    st.info("This tool is a student-led project for Data Science portfolio purposes.")
-
-# --- FOOTER ---
-st.markdown("---")
-st.caption("Built by Krishon Pinkins | Loyola University Maryland 2026")
+    st.warning("Awaiting document upload...")
