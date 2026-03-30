@@ -1,4 +1,4 @@
-[import streamlit as st
+import streamlit as st
 import pdfplumber
 import re
 import pandas as pd
@@ -92,4 +92,4 @@ else:
 
 # --- FOOTER ---
 st.markdown("---")
-st.caption("Built by Krishon Pinkins | Loyola University Maryland 2026")]
+st.caption("Built by Krishon Pinkins | Loyola University Maryland 2026")
