@@ -8,7 +8,7 @@ import base64
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Loyola Advisor", layout="wide", page_icon="🎓")
 
-# --- CUSTOM CSS: DEFINED BORDERS & GLASSMORPHISM ---
+# --- CUSTOM CSS: SEAL OVERLAY & GLASSMORPHISM ---
 def get_base64(bin_file):
     with open(bin_file, 'rb') as f:
         return base64.b64encode(f.read()).decode()
@@ -17,40 +17,31 @@ def set_style(img_file):
     bin_str = get_base64(img_file) if os.path.exists(img_file) else ""
     st.markdown(f'''
         <style>
-        /* 1. Background Image of Black Student */
         .stApp {{
             background-image: url("data:image/jpeg;base64,{bin_str}");
             background-size: cover;
             background-position: center;
             background-attachment: fixed;
         }}
-        
-        /* 2. Main Containers: Glassmorphism Effect */
         .stApp > div {{
             background-color: rgba(10, 10, 10, 0.85) !important;
-            backdrop-filter: blur(10px);
-            padding: 2.5rem;
+            backdrop-filter: blur(8px);
+            padding: 2rem;
             border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.15); /* Defines the edges */
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }}
-        
-        /* 3. Sidebar: Strong Green Divider */
         [data-testid="stSidebar"] {{
             background-color: rgba(15, 15, 15, 0.98) !important;
             border-right: 3px solid #006838 !important;
+            z-index: 100; /* Keeps sidebar below the seal overlay */
         }}
-
-        /* 4. Headers & Metrics */
-        h1 {{ color: #006838 !important; font-weight: 800 !important; text-shadow: 2px 2px 4px rgba(0,0,0,0.5); }}
+        h1 {{ color: #006838 !important; font-weight: 800 !important; }}
         [data-testid="stMetric"] {{ 
             background-color: rgba(255, 255, 255, 0.07) !important; 
             border: 1px solid rgba(255, 255, 255, 0.2) !important;
             border-left: 6px solid #006838 !important; 
             border-radius: 10px !important;
         }}
-        
-        /* 5. Fixed Positioning */
         .footer {{
             position: fixed;
             left: 0;
@@ -60,14 +51,16 @@ def set_style(img_file):
             color: #ffffff;
             font-size: 13px;
             font-weight: 500;
-            z-index: 100;
+            z-index: 1000;
         }}
+        /* THE CRITICAL FIX: Higher Z-Index and Right-Offset */
         .bottom-left-seal {{
             position: fixed;
-            left: 35px;
-            bottom: 35px;
-            z-index: 200;
-            filter: drop-shadow(0px 6px 12px rgba(0,0,0,0.8));
+            left: 350px; /* Moves it out from behind the sidebar */
+            bottom: 30px;
+            z-index: 999999 !important; /* Forces it to the very top */
+            filter: drop-shadow(0px 6px 12px rgba(0,0,0,0.9));
+            pointer-events: none;
         }}
         </style>
         ''', unsafe_allow_html=True)
@@ -98,11 +91,9 @@ with st.sidebar:
 
 # --- MAIN UI ---
 st.title("🎓 Loyola Data Science Advisor")
-
 if uploaded_files:
     if float(qpa_val) >= 3.5:
         st.success(f"### 🎉 Honors Candidate: {qpa_val} QPA")
-    
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("📅 Recommended Spring 2026 Schedule")
@@ -115,9 +106,9 @@ if uploaded_files:
 else:
     st.info("Awaiting document upload to sync your profile.")
 
-# --- SEAL & FOOTER ---
+# --- SEAL & FOOTER OVERLAYS ---
 if os.path.exists("LoyolaSeal.png"):
     seal_base64 = get_base64("LoyolaSeal.png")
-    st.markdown(f'<div class="bottom-left-seal"><img src="data:image/png;base64,{seal_base64}" width="145"></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="bottom-left-seal"><img src="data:image/png;base64,{seal_base64}" width="150"></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
