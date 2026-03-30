@@ -16,6 +16,33 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# --- SIDEBAR: DYNAMIC STUDENT PROFILE ---
+with st.sidebar:
+    st.image("https://www.loyola.edu/_/-/media/department/brand/logos/loyola-logo-green.png", width=180)
+    st.header("👤 Advisor Dashboard")
+    
+    # Check if a file has been uploaded to show real data, otherwise show placeholders
+    if audit_file is not None:
+        st.subheader("Current Standing")
+        # These variables (earned, qpa_value) come from your PDF scraping logic below
+        st.metric(label="Cumulative QPA", value=f"{qpa_value}") 
+        
+        # Calculate progress percentage (capped at 100%)
+        progress_perc = min(earned / 120, 1.0)
+        st.write(f"**Degree Progress:** {earned} / 120 Credits")
+        st.progress(progress_perc)
+        
+        if earned >= 120:
+            st.success("✅ Credit Requirement Met")
+        else:
+            st.warning(f"⚠️ {120 - earned} Credits Remaining")
+    else:
+        st.info("👋 Welcome! Please upload your Degree Audit PDF to see your personalized progress.")
+
+    st.divider()
+    st.write("**Academic Year:** 2025-2026")
+    st.caption("Loyola University Maryland | Data Science Department")
+
 st.title("🎓 Loyola Data Science Advisor")
 
 # --- 2. UPLOADS & INPUTS (Individual Sections) ---
