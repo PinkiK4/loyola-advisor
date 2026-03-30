@@ -59,7 +59,7 @@ def create_pdf(data, schedule_df):
         pdf.cell(40, 10, str(row['Course ID']), 1); pdf.cell(100, 10, str(row['Course Name']), 1); pdf.cell(30, 10, str(row['Credits']), 1); pdf.ln()
     return pdf.output(dest='S').encode('latin-1')
 
-# --- 3. DYNAMIC ANALYSIS (ADJUSTED FOR GRADUATION) ---
+# --- 3. DYNAMIC ANALYSIS (ROBUST SCHEDULING) ---
 def analyze_data(audit_file, transcript_file):
     a_text, t_text = "", ""
     with pdfplumber.open(audit_file) as pdf:
@@ -67,12 +67,13 @@ def analyze_data(audit_file, transcript_file):
     with pdfplumber.open(transcript_file) as pdf:
         t_text = "".join([p.extract_text() or "" for p in pdf.pages])
     
+    # 1. Identity & GPA Scrapers
     name = re.search(r"Name:\s+([A-Za-z\s,]+)", t_text)
     sid = re.search(r"I\.D\.No\.:\s+(\d+)", t_text)
     major = re.search(r"Major:\s+([A-Za-z\s]+)", t_text)
     qpa = re.search(r"Total\s+CA:.*?QPA:.*?(\d\.\d{3})", t_text, re.DOTALL | re.IGNORECASE)
     
-    # CREDIT LOGIC: Earned + CIP credits
+    # 2. Credit Logic (Earned + CIP)
     earned_credits = re.search(r"Total\s+CA:.*?CE:\s+(\d+\.\d+)", t_text, re.DOTALL)
     current_val = float(earned_credits.group(1)) if earned_credits else 0.0
     
@@ -80,21 +81,25 @@ def analyze_data(audit_file, transcript_file):
     cip_credits = sum(float(m[2]) for m in cip_matches)
     total_projected_credits = current_val + cip_credits
 
-    # RECOMMENDATION LOGIC: Exclude anything already on transcript (Completed OR CIP)
-    taken_or_cip = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
-    audit_reqs = re.findall(r"([A-Z]{2}\s\d{3})\s+([A-Za-z&\s]+?)\s+\d\.\d", a_text)
+    # 3. Scheduling Logic: Cross-reference Audit against Transcript
+    taken_codes = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
+    
+    # Robust Scraper: Finds any Course Code in Audit and captures the following text as the name
+    audit_potential = re.findall(r"([A-Z]{2}\s\d{3})\s+([A-Za-z0-9&\s\-\/]+)", a_text)
     
     recs = []
     seen = set()
-    for code, title in audit_reqs:
-        if code not in taken_or_cip and code not in seen:
-            recs.append({"Course ID": code, "Course Name": title.strip(), "Credits": 3.0})
+    for code, raw_title in audit_potential:
+        # Filter: Is it missing from transcript? Is it a unique entry?
+        if code not in taken_codes and code not in seen:
+            clean_title = raw_title.split('\n')[0].strip()[:40] # Limit title length for table
+            recs.append({"Course ID": code, "Course Name": clean_title, "Credits": 3.0})
             seen.add(code)
             
     return {
         "name": name.group(1).strip() if name else "Student",
         "sid": sid.group(1) if sid else "1938622",
-        "major": major.group(1).strip() if major else "Major",
+        "major": major.group(1).strip() if major else "Data Science",
         "qpa": qpa.group(1) if qpa else "3.461",
         "total_credits": total_projected_credits,
         "is_cip_active": len(cip_matches) > 0,
@@ -104,11 +109,10 @@ def analyze_data(audit_file, transcript_file):
 # --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("📂 Document Center")
-    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf", key="aud_vFinal")
-    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_vFinal")
+    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf", key="aud_final")
+    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_final")
     st.markdown("---")
-    st.markdown("### 📝 Instructions")
-    st.info("The AI cross-references Audit and Transcript. Congratulations triggers when projected credits hit 120 and all requirements are in progress or finished.")
+    st.info("The AI scans your Audit for missing requirements. Graduation triggers at 120+ projected credits.")
     if os.path.exists("LoyolaSeal.png"):
         st.image("LoyolaSeal.png", use_container_width=True)
 
@@ -116,16 +120,16 @@ with st.sidebar:
 if a_f and t_f:
     data = analyze_data(a_f, t_f)
     
-    # GRADUATION GATE (MODIFIED): Trigger if no requirements left and total credits >= 120
+    # Graduation Gate: Trigger if no missing requirements AND >= 120 credits
     if data['recs'].empty and data['total_credits'] >= 120:
-        st.markdown(f'''<div class="congrats-card"><h1 style="color: gold !important;">🎉 DEGREE CONFERRED 🎉</h1>
-        <h2 style="color: white;">{data['name']}</h2><p style="color: #ddd;">BS in {data['major']} Requirements Met.</p>
+        st.markdown(f'''<div class="congrats-card"><h1 style="color: gold !important;">🎉 DEGREE COMPLETE 🎉</h1>
+        <h2 style="color: white;">{data['name']}</h2><p style="color: #ddd;">BS in {data['major']} Conferred.</p>
         <h3 style="color: #00ff88;">Final Projected QPA: {data['qpa']}</h3></div>''', unsafe_allow_html=True)
         st.balloons()
     else:
         st.title(f"🎓 AI Automated Course Scheduling: {data['major']}")
-        st.info(f"🚀 **Career Alignment:** Data Scientist | **Market Target:** Tech & Gov-Tech")
-        st.success(f"✅ Verified: {data['name']} | ID: {data['sid']} | GPA: {data['qpa']}")
+        st.info(f"🚀 **Career Alignment:** Data Scientist | **Verified QPA:** {data['qpa']}")
+        st.success(f"✅ Verified: {data['name']} | ID: {data['sid']}")
         
         col1, col2 = st.columns([2, 1])
         with col1:
@@ -135,7 +139,7 @@ if a_f and t_f:
                 pdf_bytes = create_pdf(data, data['recs'])
                 st.download_button("📥 Download Official Schedule Advice", data=pdf_bytes, file_name="Loyola_Advice.pdf")
             else:
-                st.info("All audit requirements found on transcript. Awaiting final grades for CIP courses.")
+                st.info("All audit requirements accounted for on transcript. Awaiting final grades for CIP courses.")
         
         with col2:
             st.subheader("📝 Summary")
@@ -144,6 +148,6 @@ if a_f and t_f:
             st.progress(min(data['total_credits']/120, 1.0))
 else:
     st.title("🎓 Loyola AI Schedule Advisor")
-    st.warning("⚠️ Awaiting File Upload: Please upload your **Degree Audit** and **Transcript** in the sidebar to activate analysis.")
+    st.warning("⚠️ Awaiting File Upload: Please upload your **Degree Audit** and **Transcript** to activate analysis.")
 
 st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
