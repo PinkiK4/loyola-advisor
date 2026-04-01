@@ -1,201 +1,488 @@
-import streamlit as st
-import pdfplumber
-import re
-import pandas as pd
-import os
 import base64
+import os
+import re
+import tempfile
+from collections import OrderedDict
+
+import pandas as pd
+import pdfplumber
+import streamlit as st
 from fpdf import FPDF
 
-# --- 1. PAGE CONFIG & THEME ---
-st.set_page_config(page_title="AI Schedule Advisor | Loyola 2026", layout="wide", page_icon="🎓")
 
-def get_base64(bin_file):
+st.set_page_config(
+    page_title="AI Schedule Advisor | Loyola 2026",
+    layout="wide",
+    page_icon="🎓",
+)
+
+
+def get_base64(bin_file: str) -> str:
     if os.path.exists(bin_file):
-        with open(bin_file, 'rb') as f:
-            return base64.b64encode(f.read()).decode()
+        with open(bin_file, "rb") as file:
+            return base64.b64encode(file.read()).decode()
     return ""
 
-def set_style(img_file):
+
+def set_style(img_file: str) -> None:
     bin_str = get_base64(img_file)
-    st.markdown(f'''
+    st.markdown(
+        f"""
         <style>
         .stApp {{
             background-image: url("data:image/jpeg;base64,{bin_str}");
-            background-size: cover; background-position: center; background-attachment: fixed;
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
         }}
         .stApp > div {{
             background-color: rgba(10, 10, 10, 0.72) !important;
-            backdrop-filter: blur(10px); padding: 2rem; border-radius: 20px;
+            backdrop-filter: blur(10px);
+            padding: 2rem;
+            border-radius: 20px;
             border: 1px solid rgba(255, 255, 255, 0.1);
         }}
-        h1 {{ color: #006838 !important; font-weight: 800 !important; }}
+        h1, h2, h3 {{
+            color: #e8f6ee !important;
+        }}
         [data-testid="stSidebar"] {{
             background-color: rgba(15, 15, 15, 0.98) !important;
             border-right: 5px solid #006838 !important;
         }}
-        .footer {{ position: fixed; left: 0; bottom: 8px; width: 100%; text-align: center; color: white; font-size: 13px; z-index: 1000; }}
+        .info-card {{
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 12px;
+        }}
+        .footer {{
+            position: fixed;
+            left: 0;
+            bottom: 8px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            font-size: 13px;
+            z-index: 1000;
+        }}
         </style>
-        ''', unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 set_style("Background.jpeg")
 
-# --- 2. ENGINES ---
-def create_pdf(data, schedule_df):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(200, 10, f"AI Schedule Advice: {data['major']}", ln=True, align='C')
-    pdf.ln(10)
 
-    pdf.set_font("Arial", size=11)
-    pdf.cell(100, 8, f"Student: {data['name']} | ID: {data['sid']}", ln=1)
-    pdf.cell(100, 8, f"Cumulative QPA: {data['qpa']}", ln=1)
-    pdf.ln(10)
+STATUS_WORDS = ("Completed", "Not Started", "In Progress", "Fulfi lled", "Fulfilled")
+GRADE_TOKENS = {
+    "A",
+    "A-",
+    "B+",
+    "B",
+    "B-",
+    "C+",
+    "C",
+    "C-",
+    "D+",
+    "D",
+    "D-",
+    "F",
+    "P",
+    "S",
+    "U",
+    "W",
+    "AU",
+    "IP",
+    "CIP",
+}
 
-    pdf.set_font("Arial", 'B', 11)
-    pdf.cell(40, 10, "ID", 1)
-    pdf.cell(100, 10, "Course", 1)
-    pdf.cell(30, 10, "Credits", 1)
-    pdf.ln()
 
-    pdf.set_font("Arial", size=10)
-    for _, row in schedule_df.iterrows():
-        pdf.cell(40, 10, str(row['Course ID']), 1)
-        pdf.cell(100, 10, str(row['Course Name']), 1)
-        pdf.cell(30, 10, str(row['Credits']), 1)
-        pdf.ln()
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-    return pdf.output(dest='S').encode('latin-1')
 
-# --- 3. DYNAMIC ANALYSIS ENGINE ---
-def analyze_data(audit_file, transcript_file):
-    a_text, t_text = "", ""
+def normalize_course_code(subject: str, number: str) -> str:
+    return f"{subject.strip().upper()} {number.strip()}"
 
-    with pdfplumber.open(audit_file) as pdf:
-        a_text = "".join([p.extract_text() or "" for p in pdf.pages])
 
-    with pdfplumber.open(transcript_file) as pdf:
-        t_text = "".join([p.extract_text() or "" for p in pdf.pages])
+def uploaded_pdf_text(uploaded_file) -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        temp_path = tmp.name
 
-    # --- DEBUG (optional) ---
-    # st.text(t_text[:2000])
+    try:
+        with pdfplumber.open(temp_path) as pdf:
+            return "\n".join((page.extract_text() or "") for page in pdf.pages)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
-    # 1. QPA
-    qpa_m = re.search(r"Total CA:.*?QPA:.*?(\d\.\d{3})", t_text, re.DOTALL | re.IGNORECASE)
-    qpa = qpa_m.group(1) if qpa_m else "3.548"
 
-    # 2. CREDITS
-    ce_m = re.search(r"CE:\s+(\d+\.\d+)", t_text)
-    total_ce = float(ce_m.group(1)) if ce_m else 111.0
+def parse_transcript(text: str) -> dict:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # 3. NAME EXTRACTION
-    name_m = re.search(r"Name:\s*([A-Za-z,\s]+)", t_text)
-    if name_m:
-        name = name_m.group(1).strip()
-    else:
-        alt_name = re.search(r"([A-Z]+,\s+[A-Z]+)", t_text)
-        name = alt_name.group(1).title() if alt_name else "Unknown Student"
+    name = "Unknown Student"
+    sid = "N/A"
+    major = "Unknown"
+    total_credits = 0.0
+    gpa = "N/A"
+    course_rows = []
+    qpa_values = []
+    current_term = ""
 
-    # 4. STUDENT ID EXTRACTION
-    sid_m = re.search(r"(?:Student ID|ID|SID):\s*(\d{6,10})", t_text)
-    sid = sid_m.group(1) if sid_m else "N/A"
-
-    # 5. COURSES TAKEN
-    taken = set(re.findall(r"([A-Z]{2}\*?\s?\d{3})", t_text))
-
-    fulfilled_blocks = re.findall(
-        r"(?:Fulfilled|Completed|Transfer Equivalency).*?([A-Z]{2}\*?\d{3})",
-        a_text,
-        re.DOTALL
+    term_heading_pattern = re.compile(r"^(Fall|Spring|Summer|Winter)\s+\d{2}$", re.I)
+    course_pattern = re.compile(
+        r"^([A-Z]{2,4})\s+(\d{3})\s+([A-Z0-9]{2,3})\s*(.+?)\s+(\d+\.\d{2})(?:\s+([A-Z][+-]?|CIP|IP|P|S|U|W|AU))?$"
     )
 
-    for f in fulfilled_blocks:
-        taken.add(f.replace("*", " "))
+    for line in lines:
+        if line.startswith("Name:"):
+            cleaned = re.sub(r"\s+LOYOLA UNIVERSITY MARYLAND.*", "", line)
+            name = cleaned.replace("Name:", "", 1).strip() or name
 
-    # 6. NOT STARTED COURSES (FIXED)
-    audit_matches = re.findall(
-        r"Not Started\s+([A-Z]{2}\*?\d{3})\s+([A-Za-z\s&]+)",
-        a_text
+        sid_match = re.search(r"(?:I\.D\.No\.|Student ID|ID|SID):\s*(\d{5,10})", line, re.I)
+        if sid_match:
+            sid = sid_match.group(1)
+
+        major_match = re.search(r"Major:\s*(.+)", line, re.I)
+        if major_match:
+            major = normalize_space(major_match.group(1))
+
+        total_match = re.search(r"Total CA:\s*[\d.]+\s+CE:\s*([\d.]+).*QPA:\s*([\d.]+)", line, re.I)
+        if total_match:
+            total_credits = float(total_match.group(1))
+            qpa_values.append(float(total_match.group(2)))
+
+        qpa_match = re.search(r"QPA:\s*([\d.]+)", line, re.I)
+        if qpa_match:
+            qpa_values.append(float(qpa_match.group(1)))
+
+        if term_heading_pattern.match(line):
+            current_term = line
+
+        course_match = course_pattern.match(line)
+        if course_match:
+            subject, number, section, raw_title, credits, grade = course_match.groups()
+            code = normalize_course_code(subject, number)
+            course_rows.append(
+                {
+                    "Course ID": code,
+                    "Course Name": normalize_space(raw_title),
+                    "Section": section,
+                    "Credits": float(credits),
+                    "Grade": grade or "",
+                    "Term": current_term,
+                }
+            )
+
+    nonzero_qpas = [value for value in qpa_values if value > 0]
+    if nonzero_qpas:
+        gpa = f"{nonzero_qpas[-1]:.3f}"
+
+    courses_df = pd.DataFrame(course_rows)
+    taken_codes = set(courses_df["Course ID"].tolist()) if not courses_df.empty else set()
+    in_progress_codes = (
+        set(courses_df.loc[courses_df["Grade"].isin({"CIP", "IP"}), "Course ID"].tolist())
+        if not courses_df.empty
+        else set()
     )
-
-    recs = []
-    seen = set()
-
-    for raw_code, raw_title in audit_matches:
-        code = raw_code.replace("*", " ").strip()
-        if code not in taken and code not in seen:
-            recs.append({
-                "Course ID": code,
-                "Course Name": raw_title.strip()[:35],
-                "Credits": 3.0
-            })
-            seen.add(code)
-
-    final_recs = pd.DataFrame(recs).head(5)
-
-    # 7. MAJOR
-    major_m = re.search(r"Major:\s+([A-Za-z\s]+)", t_text)
-    major = major_m.group(1).strip() if major_m else "Data Science"
 
     return {
         "name": name,
         "sid": sid,
         "major": major,
-        "qpa": qpa,
-        "total": total_ce,
-        "recs": final_recs
+        "qpa": gpa,
+        "total": total_credits,
+        "courses_df": courses_df,
+        "taken_codes": taken_codes,
+        "in_progress_codes": in_progress_codes,
     }
 
-# --- 4. SIDEBAR ---
+
+def parse_audit(text: str) -> dict:
+    lines = [line.rstrip() for line in text.splitlines()]
+    requirement_rows = []
+    current_section = "Requirements"
+    current_block = "Degree Requirement"
+    current_block_complete = None
+    section_pattern = re.compile(r"^[A-Z][A-Za-z/&,\-\s]{3,}$")
+    course_line_pattern = re.compile(
+        r"^(Not Started|In Progress|Completed|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})\s+(.+)$",
+        re.I,
+    )
+    block_progress_pattern = re.compile(
+        r"(\d+)\s+of\s+(\d+)\s+(?:Courses|Credits)?\s*Completed\.?$",
+        re.I,
+    )
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if (
+            section_pattern.match(line)
+            and "Page " not in line
+            and "Status Course Grade Term Credits" not in line
+            and not any(line.startswith(prefix) for prefix in STATUS_WORDS)
+            and len(line.split()) <= 6
+        ):
+            current_section = normalize_space(line)
+            continue
+
+        if line.startswith("Take ") or re.match(r"^\d+\.\s+Take ", line):
+            current_block = normalize_space(line)
+            continue
+
+        progress_match = block_progress_pattern.search(line)
+        if progress_match:
+            current_block_complete = int(progress_match.group(1)) >= int(progress_match.group(2))
+            continue
+
+        if line.endswith("Fulfilled") and "Status Course Grade Term Credits" not in line:
+            current_block_complete = True
+            current_block = normalize_space(line)
+            continue
+
+        if line == "Not Started":
+            current_block_complete = False
+            continue
+
+        match = course_line_pattern.match(line)
+        if not match:
+            continue
+
+        status, subject, number, title = match.groups()
+        code = normalize_course_code(subject, number)
+        requirement_rows.append(
+            {
+                "Audit Status": normalize_space(status),
+                "Course ID": code,
+                "Course Name": normalize_space(title),
+                "Requirement Area": current_section,
+                "Requirement Block": current_block,
+                "Requirement Complete": current_block_complete,
+            }
+        )
+
+    requirements_df = pd.DataFrame(requirement_rows)
+    if requirements_df.empty:
+        return {"requirements_df": requirements_df, "audit_gpa": "N/A"}
+
+    requirements_df = requirements_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    audit_gpa_match = re.search(r"Cumulative GPA:\s*([\d.]+)", text, re.I)
+    audit_gpa = audit_gpa_match.group(1) if audit_gpa_match else "N/A"
+
+    return {"requirements_df": requirements_df, "audit_gpa": audit_gpa}
+
+
+def parse_catalogs(catalog_files) -> pd.DataFrame:
+    entries = OrderedDict()
+    course_pattern = re.compile(
+        r"\b([A-Z]{2,4})\s+(\d{3})\s*[-:]\s*([A-Za-z0-9&,'/().\- ]+?)(?=\s{2,}|Prerequisite|Corequisite|$)"
+    )
+    credit_pattern = re.compile(r"(\d+(?:\.\d+)?)\s+credits?", re.I)
+
+    for catalog_file in catalog_files:
+        text = uploaded_pdf_text(catalog_file)
+        for raw_line in text.splitlines():
+            line = normalize_space(raw_line)
+            match = course_pattern.search(line)
+            if not match:
+                continue
+
+            subject, number, title = match.groups()
+            code = normalize_course_code(subject, number)
+            credits_match = credit_pattern.search(line)
+            entries[code] = {
+                "Course ID": code,
+                "Catalog Title": normalize_space(title),
+                "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
+            }
+
+    return pd.DataFrame(entries.values()) if entries else pd.DataFrame()
+
+
+def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame) -> pd.DataFrame:
+    requirements_df = audit_data["requirements_df"]
+    if requirements_df.empty:
+        return pd.DataFrame()
+
+    pending_df = requirements_df.copy()
+    pending_df = pending_df[pending_df["Requirement Complete"] != True].copy()
+    pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
+    pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+
+    if not catalog_df.empty:
+        pending_df = pending_df.merge(catalog_df, on="Course ID", how="left")
+        pending_df["Course Name"] = pending_df["Catalog Title"].fillna(pending_df["Course Name"])
+        pending_df["Credits"] = pending_df["Catalog Credits"].fillna(3.0)
+    else:
+        pending_df["Credits"] = 3.0
+
+    pending_df["Level"] = pending_df["Course ID"].str.extract(r"(\d{3})").astype(float)
+    pending_df["Recommended Term"] = pending_df["Course ID"].apply(
+        lambda code: "Current Term" if code in transcript_data["in_progress_codes"] else "Next Term"
+    )
+    pending_df["Priority"] = pending_df["Recommended Term"].map({"Current Term": 0, "Next Term": 1}).fillna(9)
+
+    pending_df = pending_df.sort_values(
+        by=["Priority", "Recommended Term", "Level", "Course ID"], ascending=[True, True, True, True]
+    )
+
+    return pending_df[
+        [
+            "Recommended Term",
+            "Requirement Area",
+            "Requirement Block",
+            "Course ID",
+            "Course Name",
+            "Credits",
+            "Audit Status",
+        ]
+    ].reset_index(drop=True)
+
+
+def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "AI Schedule Advice", ln=True, align="C")
+    pdf.ln(4)
+
+    pdf.set_font("Arial", size=11)
+    pdf.cell(0, 8, f"Student: {student['name']} | ID: {student['sid']}", ln=True)
+    pdf.cell(0, 8, f"Major: {student['major']} | GPA: {student['qpa']}", ln=True)
+    pdf.cell(0, 8, f"Earned Credits: {student['total']}", ln=True)
+    pdf.ln(6)
+
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(34, 8, "Course ID", 1)
+    pdf.cell(86, 8, "Course Name", 1)
+    pdf.cell(25, 8, "Credits", 1)
+    pdf.cell(35, 8, "Term", 1)
+    pdf.ln()
+
+    pdf.set_font("Arial", size=9)
+    for _, row in schedule_df.iterrows():
+        pdf.cell(34, 8, str(row["Course ID"])[:15], 1)
+        pdf.cell(86, 8, str(row["Course Name"])[:42], 1)
+        pdf.cell(25, 8, str(row["Credits"]), 1)
+        pdf.cell(35, 8, str(row["Recommended Term"])[:16], 1)
+        pdf.ln()
+
+    return pdf.output(dest="S").encode("latin-1")
+
+
 with st.sidebar:
-    st.header("📂 Document Center")
-    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf", key="aud_final")
-    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf", key="tra_final")
+    st.header("Document Center")
+    audit_file = st.file_uploader("1. Upload Degree Audit", type="pdf", key="audit")
+    transcript_file = st.file_uploader("2. Upload Official Transcript", type="pdf", key="transcript")
+    catalog_files = st.file_uploader(
+        "3. Optional Course Catalog PDFs",
+        type="pdf",
+        accept_multiple_files=True,
+        key="catalogs",
+    )
+    st.caption("Catalog PDFs improve titles, credits, and future prerequisite logic.")
     st.divider()
 
     if os.path.exists("LoyolaSeal.png"):
         st.image("LoyolaSeal.png", use_container_width=True)
 
-# --- 5. MAIN UI ---
-if a_f and t_f:
-    data = analyze_data(a_f, t_f)
 
-    st.title("AI Schedule Advisor")
+st.title("Loyola AI Schedule Advisor")
 
-    st.markdown(f'''
-        <div style="background-color: #162a3d; padding: 15px; border-radius: 8px; border-left: 5px solid #3498db; margin-bottom: 10px;">
-            🚀 <b>Career Alignment:</b> {data['major']} | Market: Tech, AI & Analytics
+if audit_file and transcript_file:
+    transcript_text = uploaded_pdf_text(transcript_file)
+    audit_text = uploaded_pdf_text(audit_file)
+
+    transcript_data = parse_transcript(transcript_text)
+    audit_data = parse_audit(audit_text)
+    catalog_df = parse_catalogs(catalog_files or [])
+    schedule_df = build_schedule(transcript_data, audit_data, catalog_df)
+
+    transcript_gpa = transcript_data["qpa"]
+    audit_gpa = audit_data["audit_gpa"]
+    gpa_display = transcript_gpa if transcript_gpa != "N/A" else audit_gpa
+
+    st.markdown(
+        f"""
+        <div class="info-card" style="background-color: #162a3d; border-left: 5px solid #3498db;">
+            <b>Profile:</b> {transcript_data['name']} | ID: {transcript_data['sid']} | Major: {transcript_data['major']}
         </div>
-        <div style="background-color: #1b3d2c; padding: 15px; border-radius: 8px; border-left: 5px solid #28a745; margin-bottom: 25px;">
-            ✅ <b>Verified:</b> {data['name']} | ID: {data['sid']} | GPA: {data['qpa']}
+        <div class="info-card" style="background-color: #1b3d2c; border-left: 5px solid #28a745;">
+            <b>GPA / Credits:</b> GPA {gpa_display} | Earned Credits {transcript_data['total']}
         </div>
-    ''', unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    col1, col2 = st.columns([2, 1])
+    left_col, right_col = st.columns([2, 1])
 
-    with col1:
-        st.subheader("📅 Recommended Next Steps")
-        if not data['recs'].empty:
-            st.table(data['recs'])
-            pdf_bytes = create_pdf(data, data['recs'])
-            st.download_button(
-                "📥 Download Official Advice",
-                data=pdf_bytes,
-                file_name="Loyola_Advice.pdf"
-            )
+    with left_col:
+        st.subheader("Recommended Schedule")
+        if schedule_df.empty:
+            st.success("No remaining courses were detected from the audit.")
         else:
-            st.success("Requirements met! Graduation threshold achieved.")
+            st.dataframe(schedule_df, use_container_width=True, hide_index=True)
+            pdf_bytes = create_pdf(
+                {
+                    "name": transcript_data["name"],
+                    "sid": transcript_data["sid"],
+                    "major": transcript_data["major"],
+                    "qpa": gpa_display,
+                    "total": transcript_data["total"],
+                },
+                schedule_df.head(8),
+            )
+            st.download_button(
+                "Download Schedule Advice PDF",
+                data=pdf_bytes,
+                file_name="Loyola_Schedule_Advice.pdf",
+            )
 
-    with col2:
-        st.subheader("📝 Graduation Summary")
-        st.metric("Projected Total Credits", f"{data['total']} / 120")
-        st.progress(min(data['total']/120, 1.0))
+    with right_col:
+        st.subheader("Parsing Check")
+        st.metric("Transcript GPA", transcript_gpa)
+        st.metric("Audit GPA", audit_gpa)
+        st.metric("Transcript Courses Found", len(transcript_data["courses_df"]))
+        st.metric("Remaining Audit Courses", len(schedule_df))
+        st.metric("Catalog Matches", int(schedule_df["Course Name"].notna().sum()) if not schedule_df.empty else 0)
+
+        with st.expander("In-Progress Courses"):
+            if transcript_data["in_progress_codes"]:
+                st.write(sorted(transcript_data["in_progress_codes"]))
+            else:
+                st.write("None detected.")
+
+        with st.expander("Transcript Course Sample"):
+            st.dataframe(
+                transcript_data["courses_df"].head(12),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("Unfinished Audit Requirements"):
+            st.dataframe(
+                audit_data["requirements_df"].head(25),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if catalog_files:
+        st.caption(
+            "Catalog enrichment is active. Next step would be parsing prerequisites and term availability from the catalog."
+        )
+    else:
+        st.info("Upload course catalog PDFs if you want better course titles, credits, and later prerequisite checks.")
 
 else:
-    st.title("🎓 Loyola AI Schedule Advisor")
-    st.warning("Please upload both documents to activate the analysis engine.")
+    st.warning("Upload both the degree audit and transcript PDFs to start the analysis.")
+
 
 st.markdown(
-    f'<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>',
-    unsafe_allow_html=True
+    '<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>',
+    unsafe_allow_html=True,
 )
