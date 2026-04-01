@@ -310,6 +310,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
 
     pending_df = requirements_df.copy()
     pending_df = pending_df[pending_df["Requirement Complete"] != True].copy()
+    pending_df = pending_df[pending_df["Audit Status"].isin(["Not Started", "In Progress"])].copy()
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
 
@@ -329,6 +330,21 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = pending_df.sort_values(
         by=["Priority", "Recommended Term", "Level", "Course ID"], ascending=[True, True, True, True]
     )
+
+    selected_rows = []
+    running_credits = 0.0
+    for _, row in pending_df.iterrows():
+        credits = float(row["Credits"])
+        if running_credits + credits > 15:
+            continue
+        selected_rows.append(row)
+        running_credits += credits
+        if running_credits >= 15:
+            break
+
+    pending_df = pd.DataFrame(selected_rows)
+    if pending_df.empty:
+        return pd.DataFrame()
 
     return pending_df[
         [
@@ -449,6 +465,7 @@ if audit_file and transcript_file:
         st.metric("Audit GPA", audit_gpa)
         st.metric("Transcript Courses Found", len(transcript_data["courses_df"]))
         st.metric("Remaining Audit Courses", len(schedule_df))
+        st.metric("Suggested Credits", int(schedule_df["Credits"].sum()) if not schedule_df.empty else 0)
         st.metric("Catalog Matches", int(schedule_df["Course Name"].notna().sum()) if not schedule_df.empty else 0)
 
         with st.expander("In-Progress Courses"):
