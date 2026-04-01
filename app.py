@@ -1,7 +1,10 @@
 import base64
+import json
 import os
 import re
 import tempfile
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 
 import pandas as pd
@@ -95,6 +98,8 @@ GRADE_TOKENS = {
     "IP",
     "CIP",
 }
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
 
 def normalize_space(text: str) -> str:
@@ -103,6 +108,10 @@ def normalize_space(text: str) -> str:
 
 def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
+
+
+def get_course_subject(course_code: str) -> str:
+    return course_code.split()[0] if course_code else ""
 
 
 def uploaded_pdf_text(uploaded_file) -> str:
@@ -303,6 +312,132 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
     return pd.DataFrame(entries.values()) if entries else pd.DataFrame()
 
 
+def get_ollama_status() -> dict:
+    try:
+        request = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            models = [item.get("name", "") for item in payload.get("models", [])]
+            return {
+                "ok": response.status == 200,
+                "models": models,
+                "message": "connected",
+            }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "models": [],
+            "message": str(exc),
+        }
+
+
+def call_ollama_json(model: str, system_prompt: str, user_payload: dict) -> dict:
+    prompt = (
+        f"{system_prompt}\n\n"
+        "Return valid JSON only. Do not include markdown fences.\n\n"
+        f"{json.dumps(user_payload, ensure_ascii=True)}"
+    )
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.2},
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=120) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        return json.loads(payload["response"])
+
+
+def infer_subject_history(option_subjects: list[str], transcript_data: dict) -> dict[str, list[str]]:
+    history = {subject: [] for subject in option_subjects}
+    for course_code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"]):
+        subject = get_course_subject(course_code)
+        if subject in history:
+            history[subject].append(course_code)
+
+    for subject in history:
+        history[subject] = sorted(history[subject], key=lambda code: int(re.search(r"(\d{3})", code).group(1)))
+
+    return history
+
+
+def interpret_requirement_blocks_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
+    if pending_df.empty:
+        return pending_df, []
+
+    blocks = []
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
+        blocks.append(
+            {
+                "requirement_block": requirement_block,
+                "requirement_area": group["Requirement Area"].iloc[0],
+                "courses": group[["Course ID", "Course Name", "Audit Status"]].to_dict(orient="records"),
+            }
+        )
+
+    result = call_ollama_json(
+        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+        system_prompt=(
+            "You are the primary interpreter of a student's remaining degree requirements. "
+            "For each requirement block, decide which remaining course options are still logically relevant given the transcript. "
+            "Keep continuing sequences the student has already started. "
+            "Remove alternate-track options that no longer make sense. "
+            "Return only JSON."
+        ),
+        user_payload={
+            "student": {
+                "major": transcript_data["major"],
+                "completed_courses": sorted(transcript_data["taken_codes"]),
+                "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
+            },
+            "requirement_blocks": blocks,
+            "output_schema": {
+                "blocks": [
+                    {
+                        "requirement_block": "string",
+                        "keep_course_ids": ["string"],
+                        "reason": "string",
+                    }
+                ]
+            },
+        },
+    )
+
+    notes = []
+    kept_frames = []
+    block_map = {row["requirement_block"]: row for row in result.get("blocks", [])}
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
+        decision = block_map.get(requirement_block)
+        if not decision:
+            kept_frames.append(group)
+            continue
+        keep_ids = set(decision.get("keep_course_ids", []))
+        filtered = group[group["Course ID"].isin(keep_ids)].copy() if keep_ids else group.iloc[0:0].copy()
+        if filtered.empty:
+            filtered = group.copy()
+        kept_frames.append(filtered)
+        notes.append(
+            {
+                "requirement_block": requirement_block,
+                "reason": decision.get("reason", ""),
+                "kept_courses": ", ".join(filtered["Course ID"].tolist()),
+            }
+        )
+
+    return pd.concat(kept_frames, ignore_index=True), notes
+
+
 def apply_transcript_track_lock(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
     if pending_df.empty:
         return pending_df
@@ -312,21 +447,25 @@ def apply_transcript_track_lock(pending_df: pd.DataFrame, transcript_data: dict)
     for _, group in pending_df.groupby("Requirement Block", dropna=False):
         group = group.copy()
         option_subjects = group["Course ID"].str.extract(r"^([A-Z]{2,4})")[0].dropna().unique().tolist()
+        subject_history = infer_subject_history(option_subjects, transcript_data)
+        taken_in_block = [code for codes in subject_history.values() for code in codes]
 
-        taken_in_block = [
-            code
-            for code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"])
-            if code in set(group["Course ID"])
-        ]
-
-        if not taken_in_block:
+        if len(option_subjects) <= 1 or not taken_in_block:
             locked_groups.append(group)
             continue
 
-        taken_subjects = [code.split()[0] for code in taken_in_block]
-        preferred_subject = max(set(taken_subjects), key=taken_subjects.count)
+        preferred_subject = max(
+            option_subjects,
+            key=lambda subject: (
+                len(subject_history[subject]),
+                max(
+                    [int(re.search(r"(\d{3})", code).group(1)) for code in subject_history[subject]],
+                    default=0,
+                ),
+            ),
+        )
 
-        if preferred_subject in option_subjects:
+        if preferred_subject and subject_history.get(preferred_subject):
             group = group[group["Course ID"].str.startswith(f"{preferred_subject} ")].copy()
 
         locked_groups.append(group)
@@ -334,10 +473,135 @@ def apply_transcript_track_lock(pending_df: pd.DataFrame, transcript_data: dict)
     return pd.concat(locked_groups, ignore_index=True) if locked_groups else pending_df
 
 
-def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame) -> pd.DataFrame:
+def refine_track_locks_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
+    if pending_df.empty:
+        return pending_df, []
+
+    candidate_groups = []
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
+        option_subjects = sorted(group["Course ID"].str.extract(r"^([A-Z]{2,4})")[0].dropna().unique().tolist())
+        if len(option_subjects) <= 1:
+            continue
+
+        candidate_groups.append(
+            {
+                "requirement_block": requirement_block,
+                "requirement_area": group["Requirement Area"].iloc[0],
+                "option_subjects": option_subjects,
+                "course_options": group[["Course ID", "Course Name"]].to_dict(orient="records"),
+                "subject_history": infer_subject_history(option_subjects, transcript_data),
+            }
+        )
+
+    if not candidate_groups:
+        return pending_df, []
+
+    prompt = {
+        "transcript_courses": transcript_data["courses_df"][
+            ["Course ID", "Course Name", "Grade", "Term"]
+        ].to_dict(orient="records"),
+        "requirement_groups": candidate_groups,
+        "output_schema": {
+            "locks": [
+                {
+                    "requirement_block": "string",
+                    "locked_subject": "string or null",
+                    "reason": "string",
+                }
+            ]
+        },
+    }
+
+    result = call_ollama_json(
+        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+        system_prompt=(
+            "You determine which subject track a student has already committed to inside a degree requirement block. "
+            "Prefer the subject sequence already started on the transcript, even if the exact remaining course numbers differ. "
+            "If there is not enough evidence, set locked_subject to null. "
+            "Only choose a locked_subject from the provided option_subjects."
+        ),
+        user_payload=prompt,
+    )
+    explanations = result.get("locks", [])
+
+    for item in explanations:
+        locked_subject = item.get("locked_subject")
+        requirement_block = item.get("requirement_block")
+        if not locked_subject:
+            continue
+
+        pending_df = pending_df[
+            (pending_df["Requirement Block"] != requirement_block)
+            | (pending_df["Course ID"].str.startswith(f"{locked_subject} "))
+        ].copy()
+
+    return pending_df, explanations
+
+
+def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
+    if pending_df.empty:
+        return pending_df, []
+
+    candidates = pending_df[
+        [
+            "Course ID",
+            "Course Name",
+            "Credits",
+            "Requirement Area",
+            "Requirement Block",
+            "Recommended Term",
+            "Audit Status",
+        ]
+    ].to_dict(orient="records")
+
+    prompt = {
+        "student": {
+            "major": transcript_data["major"],
+            "earned_credits": transcript_data["total"],
+            "gpa": transcript_data["qpa"],
+            "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
+            "completed_courses": sorted(transcript_data["taken_codes"]),
+        },
+        "candidate_courses": candidates,
+        "output_schema": {
+            "selected_course_ids": ["string"],
+            "rationales": [{"course_id": "string", "reason": "string"}],
+        },
+    }
+
+    result = call_ollama_json(
+        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+        system_prompt=(
+            "You are the main decision engine for a college schedule planner. "
+            "Choose the strongest next-semester schedule from the candidate courses. "
+            "Keep the total at or under 15 credits, prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
+            "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong."
+        ),
+        user_payload=prompt,
+    )
+    selected_ids = result.get("selected_course_ids", [])
+    selected_df = pending_df[pending_df["Course ID"].isin(selected_ids)].copy()
+    selected_df["ai_rank"] = selected_df["Course ID"].apply(
+        lambda course_id: selected_ids.index(course_id) if course_id in selected_ids else 999
+    )
+    selected_df = selected_df.sort_values(by=["ai_rank", "Priority", "Level", "Course ID"]).drop(columns=["ai_rank"])
+
+    running_credits = 0.0
+    kept_rows = []
+    for _, row in selected_df.iterrows():
+        credits = float(row["Credits"])
+        if running_credits + credits > 15:
+            continue
+        kept_rows.append(row)
+        running_credits += credits
+
+    return pd.DataFrame(kept_rows), result.get("rationales", [])
+
+
+def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame, use_ai: bool = False):
     requirements_df = audit_data["requirements_df"]
     if requirements_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), []
 
     pending_df = requirements_df.copy()
     pending_df = pending_df[pending_df["Requirement Complete"] != True].copy()
@@ -363,6 +627,19 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         by=["Priority", "Recommended Term", "Level", "Course ID"], ascending=[True, True, True, True]
     )
 
+    ai_notes = []
+    if use_ai:
+        pending_df, interpreter_notes = interpret_requirement_blocks_with_ai(pending_df, transcript_data)
+        ai_notes.extend(interpreter_notes)
+
+        pending_df, track_lock_notes = refine_track_locks_with_ai(pending_df, transcript_data)
+        ai_notes.extend(track_lock_notes)
+
+        optimized_df, schedule_notes = optimize_schedule_with_ai(pending_df, transcript_data)
+        if not optimized_df.empty:
+            pending_df = optimized_df
+            ai_notes.extend(schedule_notes)
+
     selected_rows = []
     running_credits = 0.0
     for _, row in pending_df.iterrows():
@@ -376,7 +653,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
 
     pending_df = pd.DataFrame(selected_rows)
     if pending_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), ai_notes
 
     return pending_df[
         [
@@ -388,7 +665,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Credits",
             "Audit Status",
         ]
-    ].reset_index(drop=True)
+    ].reset_index(drop=True), ai_notes
 
 
 def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
@@ -434,6 +711,21 @@ with st.sidebar:
         key="catalogs",
     )
     st.caption("Catalog PDFs improve titles, credits, and future prerequisite logic.")
+    default_model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+    ollama_model = st.text_input("Ollama model", value=default_model)
+    st.session_state["ollama_model"] = ollama_model
+    ollama_status = get_ollama_status()
+    ollama_ready = ollama_status["ok"]
+    use_ai = st.toggle(
+        "Use Ollama reasoning",
+        value=ollama_ready,
+        help="Uses your local Ollama model as the primary decision engine for track selection and the final 15-credit schedule.",
+        disabled=not ollama_ready,
+    )
+    if not ollama_ready:
+        st.caption("Start Ollama locally to enable model-based track selection and schedule optimization.")
+    else:
+        st.caption(f"Ollama connected. Installed models: {', '.join(ollama_status['models'][:6]) or 'none reported'}")
     st.divider()
 
     if os.path.exists("LoyolaSeal.png"):
@@ -449,7 +741,7 @@ if audit_file and transcript_file:
     transcript_data = parse_transcript(transcript_text)
     audit_data = parse_audit(audit_text)
     catalog_df = parse_catalogs(catalog_files or [])
-    schedule_df = build_schedule(transcript_data, audit_data, catalog_df)
+    schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
 
     transcript_gpa = transcript_data["qpa"]
     audit_gpa = audit_data["audit_gpa"]
@@ -519,6 +811,10 @@ if audit_file and transcript_file:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        if ai_notes:
+            with st.expander("AI Decisions"):
+                st.dataframe(pd.DataFrame(ai_notes), use_container_width=True, hide_index=True)
 
     if catalog_files:
         st.caption(
