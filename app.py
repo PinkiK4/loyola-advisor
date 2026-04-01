@@ -303,6 +303,37 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
     return pd.DataFrame(entries.values()) if entries else pd.DataFrame()
 
 
+def apply_transcript_track_lock(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
+    if pending_df.empty:
+        return pending_df
+
+    locked_groups = []
+
+    for _, group in pending_df.groupby("Requirement Block", dropna=False):
+        group = group.copy()
+        option_subjects = group["Course ID"].str.extract(r"^([A-Z]{2,4})")[0].dropna().unique().tolist()
+
+        taken_in_block = [
+            code
+            for code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"])
+            if code in set(group["Course ID"])
+        ]
+
+        if not taken_in_block:
+            locked_groups.append(group)
+            continue
+
+        taken_subjects = [code.split()[0] for code in taken_in_block]
+        preferred_subject = max(set(taken_subjects), key=taken_subjects.count)
+
+        if preferred_subject in option_subjects:
+            group = group[group["Course ID"].str.startswith(f"{preferred_subject} ")].copy()
+
+        locked_groups.append(group)
+
+    return pd.concat(locked_groups, ignore_index=True) if locked_groups else pending_df
+
+
 def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame) -> pd.DataFrame:
     requirements_df = audit_data["requirements_df"]
     if requirements_df.empty:
@@ -313,6 +344,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = pending_df[pending_df["Audit Status"].isin(["Not Started", "In Progress"])].copy()
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    pending_df = apply_transcript_track_lock(pending_df, transcript_data)
 
     if not catalog_df.empty:
         pending_df = pending_df.merge(catalog_df, on="Course ID", how="left")
