@@ -12,6 +12,11 @@ import pdfplumber
 import streamlit as st
 from fpdf import FPDF
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 
 st.set_page_config(
     page_title="AI Schedule Advisor | Loyola 2026",
@@ -100,6 +105,7 @@ GRADE_TOKENS = {
 }
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 def normalize_space(text: str) -> str:
@@ -108,6 +114,23 @@ def normalize_space(text: str) -> str:
 
 def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
+
+
+def get_openai_api_key() -> str:
+    session_key = st.session_state.get("openai_api_key_input", "").strip()
+    if session_key:
+        return session_key
+
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        secret_key = st.secrets.get("OPENAI_API_KEY", "").strip()
+    except Exception:
+        secret_key = ""
+
+    return secret_key
 
 
 def get_course_subject(course_code: str) -> str:
@@ -331,6 +354,16 @@ def get_ollama_status() -> dict:
         }
 
 
+def get_openai_status() -> dict:
+    if OpenAI is None:
+        return {"ok": False, "message": "Install the openai package to use OpenAI."}
+
+    if not get_openai_api_key():
+        return {"ok": False, "message": "Add an OpenAI API key in the sidebar or environment."}
+
+    return {"ok": True, "message": f"Ready to use {OPENAI_MODEL}."}
+
+
 def call_ollama_json(model: str, system_prompt: str, user_payload: dict) -> dict:
     prompt = (
         f"{system_prompt}\n\n"
@@ -357,6 +390,39 @@ def call_ollama_json(model: str, system_prompt: str, user_payload: dict) -> dict
     with urllib.request.urlopen(request, timeout=120) as response:
         payload = json.loads(response.read().decode("utf-8"))
         return json.loads(payload["response"])
+
+
+def call_openai_json(model: str, system_prompt: str, user_payload: dict) -> dict:
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("No OpenAI API key is available.")
+    if OpenAI is None:
+        raise RuntimeError("The openai package is not installed.")
+
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        f"{system_prompt}\n\n"
+        "Return valid JSON only. Do not include markdown fences.\n\n"
+        f"{json.dumps(user_payload, ensure_ascii=True)}"
+    )
+    response = client.responses.create(model=model, input=prompt)
+    return json.loads((response.output_text or "").strip())
+
+
+def call_ai_json(system_prompt: str, user_payload: dict) -> dict:
+    provider = st.session_state.get("ai_provider", "ollama")
+    if provider == "openai":
+        return call_openai_json(
+            model=st.session_state.get("openai_model", OPENAI_MODEL),
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+        )
+
+    return call_ollama_json(
+        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+        system_prompt=system_prompt,
+        user_payload=user_payload,
+    )
 
 
 def infer_subject_history(option_subjects: list[str], transcript_data: dict) -> dict[str, list[str]]:
@@ -386,8 +452,7 @@ def interpret_requirement_blocks_with_ai(pending_df: pd.DataFrame, transcript_da
             }
         )
 
-    result = call_ollama_json(
-        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+    result = call_ai_json(
         system_prompt=(
             "You are the primary interpreter of a student's remaining degree requirements. "
             "For each requirement block, decide which remaining course options are still logically relevant given the transcript. "
@@ -512,8 +577,7 @@ def refine_track_locks_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         },
     }
 
-    result = call_ollama_json(
-        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+    result = call_ai_json(
         system_prompt=(
             "You determine which subject track a student has already committed to inside a degree requirement block. "
             "Prefer the subject sequence already started on the transcript, even if the exact remaining course numbers differ. "
@@ -569,8 +633,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         },
     }
 
-    result = call_ollama_json(
-        model=st.session_state.get("ollama_model", OLLAMA_MODEL),
+    result = call_ai_json(
         system_prompt=(
             "You are the main decision engine for a college schedule planner. "
             "Choose the strongest next-semester schedule from the candidate courses. "
@@ -702,6 +765,19 @@ def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
 
 with st.sidebar:
     st.header("Document Center")
+    provider_options = ["OpenAI", "Ollama"]
+    provider = st.selectbox("AI provider", provider_options, index=0)
+    st.session_state["ai_provider"] = provider.lower()
+
+    openai_model = st.text_input("OpenAI model", value=os.getenv("OPENAI_MODEL", OPENAI_MODEL))
+    st.session_state["openai_model"] = openai_model
+    st.text_input(
+        "OpenAI API Key",
+        type="password",
+        key="openai_api_key_input",
+        help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
+    )
+
     audit_file = st.file_uploader("1. Upload Degree Audit", type="pdf", key="audit")
     transcript_file = st.file_uploader("2. Upload Official Transcript", type="pdf", key="transcript")
     catalog_files = st.file_uploader(
@@ -716,16 +792,27 @@ with st.sidebar:
     st.session_state["ollama_model"] = ollama_model
     ollama_status = get_ollama_status()
     ollama_ready = ollama_status["ok"]
+    openai_status = get_openai_status()
+    openai_ready = openai_status["ok"]
+    ai_ready = openai_ready if provider == "OpenAI" else ollama_ready
     use_ai = st.toggle(
-        "Use Ollama reasoning",
-        value=ollama_ready,
-        help="Uses your local Ollama model as the primary decision engine for track selection and the final 15-credit schedule.",
-        disabled=not ollama_ready,
+        "Use AI reasoning",
+        value=ai_ready,
+        help="Uses the selected AI provider for track selection and final schedule optimization.",
+        disabled=not ai_ready,
     )
-    if not ollama_ready:
-        st.caption("Start Ollama locally to enable model-based track selection and schedule optimization.")
+    if provider == "OpenAI":
+        if not openai_ready:
+            st.caption(openai_status["message"])
+        else:
+            st.caption(openai_status["message"])
     else:
-        st.caption(f"Ollama connected. Installed models: {', '.join(ollama_status['models'][:6]) or 'none reported'}")
+        if not ollama_ready:
+            st.caption("Start Ollama locally to enable model-based track selection and schedule optimization.")
+        else:
+            st.caption(
+                f"Ollama connected. Installed models: {', '.join(ollama_status['models'][:6]) or 'none reported'}"
+            )
     st.divider()
 
     if os.path.exists("LoyolaSeal.png"):
