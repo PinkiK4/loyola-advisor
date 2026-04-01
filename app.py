@@ -1,99 +1,146 @@
 import streamlit as st
-import pandas as pd
 import pdfplumber
 import re
+import pandas as pd
+import os
+import base64
+from fpdf import FPDF
 
-# --- UI CONFIGURATION ---
-st.set_page_config(page_title="AI Schedule Advisor | Loyola 2026", layout="wide")
+# --- 1. PAGE CONFIG & THEME ---
+st.set_page_config(page_title="AI Schedule Advisor | Loyola 2026", layout="wide", page_icon="🎓")
 
-def extract_data(audit_file, transcript_file):
-    """Dynamically extracts Major, QPA, Credits, and missing requirements."""
-    incomplete = []
-    major = "Student"
-    qpa = 0.0
-    total_creds = 0.0
+def get_base64(bin_file):
+    if os.path.exists(bin_file):
+        with open(bin_file, 'rb') as f:
+            return base64.b64encode(f.read()).decode()
+    return ""
+
+def set_style(img_file):
+    bin_str = get_base64(img_file)
+    st.markdown(f'''
+        <style>
+        .stApp {{
+            background-image: url("data:image/jpeg;base64,{bin_str}");
+            background-size: cover; background-position: center; background-attachment: fixed;
+        }}
+        .stApp > div {{
+            background-color: rgba(10, 10, 10, 0.92) !important;
+            backdrop-filter: blur(15px); padding: 2rem; border-radius: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        h1 {{ color: #006838 !important; font-weight: 800 !important; }}
+        [data-testid="stSidebar"] {{
+            background-color: rgba(15, 15, 15, 0.98) !important;
+            border-right: 5px solid #006838 !important;
+        }}
+        .footer {{ position: fixed; left: 0; bottom: 8px; width: 100%; text-align: center; color: #888; font-size: 12px; }}
+        </style>
+        ''', unsafe_allow_html=True)
+
+set_style("Background.jpeg")
+
+# --- 2. DYNAMIC CAREER LOGIC ---
+def generate_career_alignment(major_name):
+    """Generates market targeting based on detected major keywords."""
+    m = major_name.upper()
+    if "DATA" in m or "STAT" in m:
+        return f"{major_name} | Market: Tech, AI & Analytics"
+    elif "COMP" in m:
+        return f"{major_name} | Market: Software & Systems Engineering"
+    elif "BUS" in m or "ECON" in m:
+        return f"{major_name} | Market: Corporate Finance & Strategy"
+    return f"{major_name} | Market: Specialized Professional Services"
+
+# --- 3. DYNAMIC ANALYSIS ENGINE ---
+def analyze_documents(audit_file, transcript_file):
+    a_text, t_text = "", ""
+    with pdfplumber.open(audit_file) as pdf:
+        a_text = "".join([p.extract_text() or "" for p in pdf.pages])
+    with pdfplumber.open(transcript_file) as pdf:
+        t_text = "".join([p.extract_text() or "" for p in pdf.pages])
     
-    # 1. Parse Transcript for QPA and Major
-    if transcript_file:
-        with pdfplumber.open(transcript_file) as pdf:
-            text = "".join([page.extract_text() for page in pdf.pages])
-            qpa_match = re.search(r"QPA:\s+(\d+\.\d+)", text)
-            if qpa_match:
-                qpa = qpa_match.group(1)
-            major_match = re.search(r"Major:\s+(.*)", text)
-            if major_match:
-                major = major_match.group(1).strip()
+    # Extract Student Info from Transcript
+    name_m = re.search(r"Name:\s+([A-Za-z\s,]+)", t_text)
+    sid_m = re.search(r"I\.D\.No\.:\s+(\d+)", t_text)
+    major_m = re.search(r"Major:\s+([A-Za-z\s]+)", t_text)
+    qpa_m = re.search(r"QPA:\s+(\d\.\d{3})", t_text)
+    
+    # Dynamic Credit Calculation
+    ce_match = re.search(r"Total\s+CE:\s+(\d+\.\d+)", t_text)
+    current_ce = float(ce_match.group(1)) if ce_match else 0.0
+    cip_pattern = re.findall(r"(\d\.\d{2})\s+CIP", t_text)
+    cip_total = sum(float(val) for val in cip_pattern)
+    projected_total = current_ce + cip_total
 
-    # 2. Parse Audit for Requirements and Credits
-    if audit_file:
-        with pdfplumber.open(audit_file) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                full_text += page_text
-                tables = page.extract_tables()
-                for table in tables:
-                    for row in table:
-                        row = [str(item).replace('\n', ' ').strip() for item in row if item]
-                        if len(row) >= 2:
-                            status = row[0].lower()
-                            course_id = row[1]
-                            # Only include In-Progress or Not Started
-                            if "not started" in status or "in-progress" in status:
-                                if "*" in course_id and course_id not in [c["Course ID"] for c in incomplete]:
-                                    incomplete.append({
-                                        "Course ID": course_id,
-                                        "Course Name": row[2] if len(row) > 2 else "Requirement",
-                                        "Credits": 3.0
-                                    })
+    # Dynamic Scheduling Logic
+    taken_codes = set(re.findall(r"([A-Z]{2}\s\d{3})", t_text))
+    # Filter Audit for "Not Started" or "In-Progress" requirements
+    audit_matches = re.findall(r"(Not Started|In-Progress)\s+([A-Z]{2}\*?\s?\d{3})\s+([A-Za-z\s&]+)", a_text)
+    
+    recs = []
+    seen = set()
+    for status, raw_code, raw_title in audit_matches:
+        code = raw_code.replace("*", " ").strip()
+        # Skip if already on transcript (handles transfers like WR 100)
+        if code not in taken_codes and code not in seen:
+            recs.append({
+                "Course ID": code,
+                "Course Name": raw_title.strip()[:40],
+                "Credits": 3.0
+            })
+            seen.add(code)
             
-            cred_match = re.search(r"Total Credits\s+(\d+)", full_text)
-            total_creds = cred_match.group(1) if cred_match else "126"
+    detected_major = major_m.group(1).strip() if major_m else "General Studies"
+            
+    return {
+        "name": name_m.group(1).strip() if name_m else "Student",
+        "sid": sid_m.group(1) if sid_m else "1938622",
+        "major": detected_major,
+        "career": generate_career_alignment(detected_major),
+        "qpa": qpa_m.group(1) if qpa_m else "0.000",
+        "total": projected_total,
+        "is_cip": len(cip_pattern) > 0,
+        "recs": pd.DataFrame(recs)
+    }
 
-    return major, qpa, total_creds, incomplete
-
-# --- SIDEBAR: DOCUMENT CENTER ---
+# --- 4. SIDEBAR ---
 with st.sidebar:
     st.header("📂 Document Center")
-    st.write("1. Upload Degree Audit")
-    audit_up = st.file_uploader("Drag and drop file here", type="pdf", key="audit_final")
-    st.write("2. Upload Official Transcript")
-    transcript_up = st.file_uploader("Drag and drop file here", type="pdf", key="trans_final")
-    
+    a_f = st.file_uploader("1. Upload Degree Audit", type="pdf")
+    t_f = st.file_uploader("2. Upload Official Transcript", type="pdf")
     st.divider()
-    st.markdown('<p style="color: #3498db; font-size: 0.8em;">The AI scans your Audit for missing requirements. Graduation triggers at 120+ projected credits.</p>', unsafe_allow_html=True)
+    st.info("Verification Engine: Compares Audit requirements against Transcript history to filter completed courses.")
 
-# --- MAIN CONTENT ---
+# --- 5. MAIN UI ---
 st.title("AI Schedule Advisor")
 
-if audit_up and transcript_up:
-    major, qpa, credits, next_steps = extract_data(audit_up, transcript_up)
-
-    # Dynamic Career Alignment & Verified Badge
-    st.markdown(f"""
-        <div style="background-color: #162a3d; padding: 12px; border-radius: 5px; border-left: 5px solid #3498db; margin-bottom: 10px;">
-            🚀 <b>Career Alignment:</b> {major} | <b>Verified QPA:</b> {qpa}
+if a_f and t_f:
+    data = analyze_documents(a_f, t_f)
+    
+    # Career Alignment Banner (Dynamic)
+    st.markdown(f'''
+        <div style="background-color: #162a3d; padding: 15px; border-radius: 8px; border-left: 5px solid #3498db; margin-bottom: 10px;">
+            🚀 <b>Career Alignment:</b> {data['career']}
         </div>
-        <div style="background-color: #1b3d2c; padding: 12px; border-radius: 5px; border-left: 5px solid #28a745; margin-bottom: 25px;">
-            ✅ <b>Verified:</b> Krishon Pinkins LOYOLA UNIVERSITY MARYLAND | <b>ID:</b> 1938622
+        <div style="background-color: #1b3d2c; padding: 15px; border-radius: 8px; border-left: 5px solid #28a745; margin-bottom: 25px;">
+            ✅ <b>Verified:</b> {data['name']} | ID: {data['sid']} | GPA: {data['qpa']}
         </div>
-        """, unsafe_allow_html=True)
-
+        ''', unsafe_allow_html=True)
+    
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("📅 Recommended Next Steps")
-        if next_steps:
-            st.table(pd.DataFrame(next_steps))
+        if not data['recs'].empty:
+            st.table(data['recs'])
         else:
-            st.success("Requirements completed.")
+            st.success("All audit requirements found on transcript. Ready for graduation review!")
 
     with col2:
-        st.subheader("📝 Summary")
-        st.metric("Projected Total Credits", f"{credits} / 120")
-        st.write("**CIP Status:** Active")
-        st.progress(min(float(credits)/120, 1.0))
+        st.subheader("📝 Graduation Summary")
+        st.metric("Projected Total Credits", f"{data['total']} / 120")
+        st.write(f"**CIP Status:** {'Active Enrollment' if data['is_cip'] else 'No Current Courses'}")
+        st.progress(min(data['total']/120, 1.0))
 else:
-    st.warning("Please upload both documents to generate your dynamic advisor report.")
+    st.warning("⚠️ Please upload your **Degree Audit** and **Transcript** in the Document Center to begin analysis.")
 
-st.divider()
-st.caption("📥 Download Official Schedule Advice | Krishon Pinkins | Loyola University Maryland 2026")
+st.markdown('<div class="footer">Built by Krishon Pinkins | Loyola University Maryland 2026</div>', unsafe_allow_html=True)
