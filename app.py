@@ -128,12 +128,154 @@ def canonicalize_audit_status(text: str) -> str:
 
 def clean_course_title(title: str) -> str:
     cleaned = normalize_space(title)
+    cleaned = re.sub(r"\b(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b\s+\d{2}/[A-Z]{2}\s+\d+(?:\.\d+)?\b", "", cleaned)
     cleaned = re.sub(r"\b\d{2}/[A-Z]{2}\b\s+\d+(?:\.\d+)?\b", "", cleaned)
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.rstrip(" -,:;")
+
+
+def parse_audit_term_code(text: str) -> str:
+    match = re.search(r"\b(\d{2}/[A-Z]{2})\b", text)
+    return match.group(1) if match else ""
+
+
+def term_sort_key(term_label: str):
+    if not term_label:
+        return None
+
+    transcript_match = re.match(r"^(Winter|Spring|Summer|Fall)\s+(\d{2})$", term_label, re.I)
+    if transcript_match:
+        season, year = transcript_match.groups()
+        season_map = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}
+        return (int(year), season_map[season.lower()])
+
+    audit_match = re.match(r"^(\d{2})/([A-Z]{2})$", term_label, re.I)
+    if audit_match:
+        year, season = audit_match.groups()
+        season_map = {"WI": 0, "SP": 1, "SU": 2, "FA": 3, "OC": -1}
+        return (int(year), season_map.get(season.upper(), 9))
+
+    return None
+
+
+def term_index(term_label: str):
+    key = term_sort_key(term_label)
+    if key is None:
+        return None
+    year, season = key
+    return year * 4 + season
+
+
+def get_latest_transcript_term(transcript_data: dict):
+    if transcript_data["courses_df"].empty:
+        return None
+
+    term_keys = [
+        term_sort_key(term)
+        for term in transcript_data["courses_df"]["Term"].dropna().unique().tolist()
+    ]
+    term_keys = [key for key in term_keys if key is not None]
+    return max(term_keys) if term_keys else None
+
+
+def requirement_category_priority(requirement_area: str, requirement_block: str, requirement_complete) -> int:
+    area = (requirement_area or "").lower()
+    block = (requirement_block or "").lower()
+
+    if requirement_complete is True:
+        base = 2
+    else:
+        base = 0
+
+    if "free elective" in block or "additional free elective" in block:
+        return base + 3
+    if "diversity requirement" in area or "diversity courses" in block:
+        return base + 2
+    if "university core" in area or "data science" in area:
+        return base
+    return base + 1
+
+
+def sequence_gap_priority(course_id: str, transcript_data: dict) -> int:
+    subject_match = re.match(r"^([A-Z]{2,4})\s+(\d{3})$", str(course_id))
+    if not subject_match:
+        return 0
+
+    subject, number = subject_match.groups()
+    target_number = int(number)
+    subject_numbers = []
+    for code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"]):
+        match = re.match(rf"^{re.escape(subject)}\s+(\d{{3}})$", str(code))
+        if match:
+            subject_numbers.append(int(match.group(1)))
+
+    if not subject_numbers:
+        return 0
+
+    highest_taken = max(subject_numbers)
+    if target_number <= highest_taken + 1:
+        return 0
+
+    # Penalize skipped sequence steps, especially lower-level progressions like languages.
+    if highest_taken < 200 and target_number < 200:
+        return target_number - highest_taken - 1
+
+    return 0
+
+
+def increment_roman_numeral(title: str) -> str:
+    roman_steps = {"I": "II", "II": "III", "III": "IV", "IV": "V"}
+    for current, nxt in roman_steps.items():
+        if re.search(rf"\b{current}\b", title):
+            return re.sub(rf"\b{current}\b", nxt, title, count=1)
+    return title
+
+
+def infer_sequenced_course(row: pd.Series, transcript_data: dict) -> pd.Series:
+    course_id = str(row["Course ID"])
+    subject_match = re.match(r"^([A-Z]{2,4})\s+(\d{3})$", course_id)
+    if not subject_match:
+        return row
+
+    subject, number = subject_match.groups()
+    target_number = int(number)
+    subject_rows = transcript_data["courses_df"][
+        transcript_data["courses_df"]["Course ID"].str.startswith(f"{subject} ", na=False)
+    ]
+    subject_numbers = []
+    for code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"]):
+        match = re.match(rf"^{re.escape(subject)}\s+(\d{{3}})$", str(code))
+        if match:
+            subject_numbers.append(int(match.group(1)))
+
+    if not subject_numbers:
+        return row
+
+    highest_taken = max(subject_numbers)
+    if not (highest_taken < target_number and highest_taken < 200 and target_number < 200):
+        return row
+
+    next_number = highest_taken + 1
+    if next_number >= target_number:
+        return row
+
+    row = row.copy()
+    row["Course ID"] = f"{subject} {next_number:03d}"
+    row["Audit Status"] = "Not Started"
+    row["Recommended Term"] = "Next Term"
+
+    previous_title = ""
+    if not subject_rows.empty:
+        previous_title = str(subject_rows.sort_values(by="Course ID").iloc[-1]["Course Name"])
+    if previous_title:
+        row["Course Name"] = increment_roman_numeral(previous_title)
+    elif not row.get("Course Name", ""):
+        row["Course Name"] = f"{subject} {next_number:03d}"
+
+    return row
 
 
 def clean_catalog_title(title: str) -> str:
@@ -401,6 +543,7 @@ def parse_audit(text: str) -> dict:
         status, subject, number, title = match.groups()
         code = normalize_course_code(subject, number)
         canonical_status = canonicalize_audit_status(status)
+        audit_term = parse_audit_term_code(title)
         block_label = current_block or "Degree Requirement"
         block_lower = block_label.lower()
         is_elective_block = "choose from" in block_lower or re.search(r"complete\s+\d+\s+courses", block_lower) is not None
@@ -409,6 +552,7 @@ def parse_audit(text: str) -> dict:
                 "Audit Status": canonical_status,
                 "Course ID": code,
                 "Course Name": clean_course_title(title),
+                "Audit Term": audit_term,
                 "Requirement Area": current_section,
                 "Requirement Block": block_label,
                 "Requirement Complete": current_block_complete,
@@ -832,8 +976,29 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         return pd.DataFrame(), []
 
     pending_df = requirements_df.copy()
-    pending_df = pending_df[pending_df["Requirement Complete"] != True].copy()
-    pending_df = pending_df[pending_df["Audit Status"].isin(["Not Started", "In Progress"])].copy()
+    latest_transcript_term = get_latest_transcript_term(transcript_data)
+    latest_transcript_index = None if latest_transcript_term is None else (latest_transcript_term[0] * 4 + latest_transcript_term[1])
+    future_term_mask = pd.Series(False, index=pending_df.index)
+    if latest_transcript_term is not None:
+        future_term_mask = pending_df.apply(
+            lambda row: (
+                row["Audit Status"] in {"Completed", "In Progress"}
+                and row.get("Audit Term", "")
+                and term_index(row["Audit Term"]) is not None
+                and row["Course ID"] not in transcript_data["taken_codes"]
+                and row["Course ID"] not in transcript_data["in_progress_codes"]
+                and row["Audit Term"][-2:] != "OC"
+                and term_index(row["Audit Term"]) > latest_transcript_index
+            ),
+            axis=1,
+        )
+
+    pending_mask = (
+        pending_df["Audit Status"].isin(["Not Started", "In Progress"])
+        | future_term_mask
+    )
+    incomplete_mask = (pending_df["Requirement Complete"] != True) | future_term_mask
+    pending_df = pending_df[incomplete_mask & pending_mask].copy()
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
@@ -845,24 +1010,54 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     else:
         pending_df["Credits"] = 3.0
 
+    pending_df["Audit Term Index"] = pending_df["Audit Term"].apply(term_index)
     pending_df["Level"] = pending_df["Course ID"].str.extract(r"(\d{3})").astype(float)
     pending_df["Recommended Term"] = pending_df.apply(
         lambda row: (
             "Current Term"
-            if row["Course ID"] in transcript_data["in_progress_codes"] or row["Audit Status"] == "In Progress"
-            else "Next Term"
+            if (
+                row["Course ID"] in transcript_data["in_progress_codes"]
+                or (
+                    row["Audit Status"] == "In Progress"
+                    and (
+                        latest_transcript_index is None
+                        or row["Audit Term Index"] is None
+                        or row["Audit Term Index"] - latest_transcript_index <= 2
+                    )
+                )
+            )
+            else (row["Audit Term"] if row.get("Audit Term", "") else "Next Term")
         ),
         axis=1,
     )
-    pending_df["Priority"] = pending_df["Recommended Term"].map({"Current Term": 0, "Next Term": 1}).fillna(9)
+    pending_df["Priority"] = pending_df["Recommended Term"].map({"Current Term": 0, "Next Term": 1}).fillna(1)
+    pending_df["Term Sort"] = pending_df["Recommended Term"].apply(
+        lambda term: term_sort_key(term) if term_sort_key(term) is not None else (99, 99)
+    )
     pending_df["Block Remaining"] = pending_df["Block Remaining"].fillna(1)
     pending_df["Block Order"] = pending_df["Block Order"].fillna(999)
     pending_df["Is Elective Block"] = pending_df["Is Elective Block"].fillna(False)
     pending_df["Block Priority"] = pending_df["Is Elective Block"].map({False: 0, True: 1}).fillna(1)
+    pending_df["Requirement Priority"] = pending_df.apply(
+        lambda row: requirement_category_priority(
+            row["Requirement Area"],
+            row["Requirement Block"],
+            row["Requirement Complete"],
+        ),
+        axis=1,
+    )
+    pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
+    pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    pending_df["Sequence Priority"] = pending_df["Course ID"].apply(
+        lambda code: sequence_gap_priority(code, transcript_data)
+    )
 
     pending_df = pending_df.sort_values(
         by=[
             "Priority",
+            "Requirement Priority",
+            "Sequence Priority",
+            "Term Sort",
             "Block Priority",
             "Block Remaining",
             "Block Order",
@@ -870,7 +1065,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True],
     )
 
     ai_notes = []
