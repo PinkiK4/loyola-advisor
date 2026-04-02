@@ -111,6 +111,21 @@ def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
 
 
+def canonicalize_audit_status(text: str) -> str:
+    normalized = normalize_space(text.replace("-", ""))
+    lowered = normalized.lower()
+    compact = lowered.replace(" ", "")
+    if compact in {"completed", "complete"}:
+        return "Completed"
+    if compact in {"inprogress"}:
+        return "In Progress"
+    if compact in {"fulfilled"}:
+        return "Fulfilled"
+    if compact in {"notstarted"}:
+        return "Not Started"
+    return normalized.title()
+
+
 def get_gemini_api_key() -> str:
     session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
@@ -144,6 +159,52 @@ def get_course_subject(course_code: str) -> str:
     return course_code.split()[0] if course_code else ""
 
 
+def should_merge_pdf_line(previous_line: str, current_line: str) -> bool:
+    if not previous_line or not current_line:
+        return False
+
+    previous = previous_line.strip()
+    current = current_line.strip()
+    if not previous or not current:
+        return False
+
+    structural_patterns = [
+        r"^(Fall|Spring|Summer|Winter)\s+\d{2}$",
+        r"^(Status|Total|Term|Degree|Major|Catalog|Description|Requirements)\b",
+        r"^\d+\.\s+",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\b",
+        r"^[A-Z]{2,4}\*?\s*\d{3}\b",
+        r"^Page:\s+\d+",
+        r"^https?://",
+        r"^[-=]{3,}$",
+    ]
+    if any(re.match(pattern, current, re.I) for pattern in structural_patterns):
+        return False
+
+    if previous.endswith((".", "!", "?", ":")):
+        return False
+
+    if re.search(r"\b\d+\.\d{2}\s+(?:[A-Z][+-]?|CIP|IP|P|S|U|W|AU)?$", previous):
+        return False
+
+    return True
+
+
+def soften_pdf_line_breaks(text: str) -> str:
+    softened_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if softened_lines and should_merge_pdf_line(softened_lines[-1], line):
+            softened_lines[-1] = f"{softened_lines[-1]} {line}".strip()
+        else:
+            softened_lines.append(line)
+
+    return "\n".join(softened_lines)
+
+
 def uploaded_pdf_text(uploaded_file) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.getbuffer())
@@ -151,7 +212,12 @@ def uploaded_pdf_text(uploaded_file) -> str:
 
     try:
         with pdfplumber.open(temp_path) as pdf:
-            return "\n".join((page.extract_text() or "") for page in pdf.pages)
+            extracted_pages = []
+            for page in pdf.pages:
+                extracted_pages.append(
+                    page.extract_text(x_tolerance=2, y_tolerance=3) or ""
+                )
+            return soften_pdf_line_breaks("\n".join(extracted_pages))
     finally:
         if os.path.exists(temp_path):
             os.unlink(temp_path)
@@ -244,9 +310,12 @@ def parse_audit(text: str) -> dict:
     current_section = "Requirements"
     current_block = "Degree Requirement"
     current_block_complete = None
+    current_block_remaining = None
+    current_block_total = None
+    block_order = 0
     section_pattern = re.compile(r"^[A-Z][A-Za-z/&,\-\s]{3,}$")
     course_line_pattern = re.compile(
-        r"^(Not Started|In Progress|Completed|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})\s+(.+)$",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})\s+(.+)$",
         re.I,
     )
     block_progress_pattern = re.compile(
@@ -269,16 +338,24 @@ def parse_audit(text: str) -> dict:
             current_section = normalize_space(line)
             continue
 
-        if line.startswith("Take ") or re.match(r"^\d+\.\s+Take ", line):
+        if line.startswith("Take ") or re.match(r"^\d+\.\s+(Take|Complete) ", line):
             current_block = normalize_space(line)
+            block_order += 1
+            current_block_complete = bool(re.search(r"Fulfi\s*lled$", line, re.I))
+            current_block_remaining = None
+            current_block_total = None
             continue
 
         progress_match = block_progress_pattern.search(line)
         if progress_match:
-            current_block_complete = int(progress_match.group(1)) >= int(progress_match.group(2))
+            completed = int(progress_match.group(1))
+            total = int(progress_match.group(2))
+            current_block_complete = completed >= total
+            current_block_remaining = max(total - completed, 0)
+            current_block_total = total
             continue
 
-        if line.endswith("Fulfilled") and "Status Course Grade Term Credits" not in line:
+        if re.search(r"Fulfi\s*lled$", line, re.I) and "Status Course Grade Term Credits" not in line:
             current_block_complete = True
             current_block = normalize_space(line)
             continue
@@ -293,14 +370,22 @@ def parse_audit(text: str) -> dict:
 
         status, subject, number, title = match.groups()
         code = normalize_course_code(subject, number)
+        canonical_status = canonicalize_audit_status(status)
+        block_label = current_block or "Degree Requirement"
+        block_lower = block_label.lower()
+        is_elective_block = "choose from" in block_lower or re.search(r"complete\s+\d+\s+courses", block_lower) is not None
         requirement_rows.append(
             {
-                "Audit Status": normalize_space(status),
+                "Audit Status": canonical_status,
                 "Course ID": code,
                 "Course Name": normalize_space(title),
                 "Requirement Area": current_section,
-                "Requirement Block": current_block,
+                "Requirement Block": block_label,
                 "Requirement Complete": current_block_complete,
+                "Block Remaining": current_block_remaining,
+                "Block Total": current_block_total,
+                "Block Order": block_order,
+                "Is Elective Block": is_elective_block,
             }
         )
 
@@ -547,8 +632,20 @@ def apply_transcript_track_lock(pending_df: pd.DataFrame, transcript_data: dict)
 
     locked_groups = []
 
-    for _, group in pending_df.groupby("Requirement Block", dropna=False):
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
         group = group.copy()
+        block_label = str(requirement_block or "")
+        block_lower = block_label.lower()
+        supports_track_lock = (
+            "choose from" in block_lower
+            or block_lower.startswith("take 1 ")
+            or block_lower.startswith("1. take 1 ")
+            or (" or " in block_lower and not block_lower.startswith("take courses"))
+        )
+        if not supports_track_lock:
+            locked_groups.append(group)
+            continue
+
         option_subjects = group["Course ID"].str.extract(r"^([A-Z]{2,4})")[0].dropna().unique().tolist()
         subject_history = infer_subject_history(option_subjects, transcript_data)
         taken_in_block = [code for codes in subject_history.values() for code in codes]
@@ -719,13 +816,31 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         pending_df["Credits"] = 3.0
 
     pending_df["Level"] = pending_df["Course ID"].str.extract(r"(\d{3})").astype(float)
-    pending_df["Recommended Term"] = pending_df["Course ID"].apply(
-        lambda code: "Current Term" if code in transcript_data["in_progress_codes"] else "Next Term"
+    pending_df["Recommended Term"] = pending_df.apply(
+        lambda row: (
+            "Current Term"
+            if row["Course ID"] in transcript_data["in_progress_codes"] or row["Audit Status"] == "In Progress"
+            else "Next Term"
+        ),
+        axis=1,
     )
     pending_df["Priority"] = pending_df["Recommended Term"].map({"Current Term": 0, "Next Term": 1}).fillna(9)
+    pending_df["Block Remaining"] = pending_df["Block Remaining"].fillna(1)
+    pending_df["Block Order"] = pending_df["Block Order"].fillna(999)
+    pending_df["Is Elective Block"] = pending_df["Is Elective Block"].fillna(False)
+    pending_df["Block Priority"] = pending_df["Is Elective Block"].map({False: 0, True: 1}).fillna(1)
 
     pending_df = pending_df.sort_values(
-        by=["Priority", "Recommended Term", "Level", "Course ID"], ascending=[True, True, True, True]
+        by=[
+            "Priority",
+            "Block Priority",
+            "Block Remaining",
+            "Block Order",
+            "Recommended Term",
+            "Level",
+            "Course ID",
+        ],
+        ascending=[True, True, True, True, True, True, True],
     )
 
     ai_notes = []
@@ -819,14 +934,19 @@ with st.sidebar:
     provider = st.selectbox("AI provider", provider_options, index=0)
     st.session_state["ai_provider"] = provider.lower()
 
-    gemini_model = st.text_input("Gemini model", value=os.getenv("GEMINI_MODEL", GEMINI_MODEL))
-    st.session_state["gemini_model"] = gemini_model
-    st.text_input(
-        "Gemini API Key",
-        type="password",
-        key="gemini_api_key_input",
-        help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
-    )
+    if provider == "Gemini":
+        gemini_model = st.text_input("Gemini model", value=os.getenv("GEMINI_MODEL", GEMINI_MODEL))
+        st.session_state["gemini_model"] = gemini_model
+        st.text_input(
+            "Gemini API Key",
+            type="password",
+            key="gemini_api_key_input",
+            help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
+        )
+    else:
+        default_model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+        ollama_model = st.text_input("Ollama model", value=default_model)
+        st.session_state["ollama_model"] = ollama_model
 
     audit_file = st.file_uploader("1. Upload Degree Audit", type="pdf", key="audit")
     transcript_file = st.file_uploader("2. Upload Official Transcript", type="pdf", key="transcript")
@@ -837,9 +957,6 @@ with st.sidebar:
         key="catalogs",
     )
     st.caption("Catalog PDFs improve titles, credits, and future prerequisite logic.")
-    default_model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
-    ollama_model = st.text_input("Ollama model", value=default_model)
-    st.session_state["ollama_model"] = ollama_model
     ollama_status = get_ollama_status()
     ollama_ready = ollama_status["ok"]
     gemini_status = get_gemini_status()
