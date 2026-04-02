@@ -126,6 +126,32 @@ def canonicalize_audit_status(text: str) -> str:
     return normalized.title()
 
 
+def clean_course_title(title: str) -> str:
+    cleaned = normalize_space(title)
+    cleaned = re.sub(r"\b\d{2}/[A-Z]{2}\b\s+\d+(?:\.\d+)?\b", "", cleaned)
+    cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.rstrip(" -,:;")
+
+
+def clean_catalog_title(title: str) -> str:
+    return clean_course_title(title)
+
+
+def build_schedule_summary(schedule_df: pd.DataFrame, ai_enabled: bool) -> str:
+    if schedule_df.empty:
+        return ""
+
+    course_bits = [
+        f"{row['Course ID']} ({row['Course Name']})"
+        for _, row in schedule_df.iterrows()
+    ]
+    intro = "AI recommendation" if ai_enabled else "Recommended path"
+    return f"{intro}: " + ", ".join(course_bits) + "."
+
+
 def get_gemini_api_key() -> str:
     session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
@@ -240,6 +266,10 @@ def parse_transcript(text: str) -> dict:
         r"^([A-Z]{2,4})\s+(\d{3})\s+([A-Z0-9]{2,3})\s*(.+?)\s+(\d+\.\d{2})(?:\s+([A-Z][+-]?|CIP|IP|P|S|U|W|AU))?$"
     )
 
+    header_name_match = re.search(r"Name:\s*(.+?)\s+LOYOLA UNIVERSITY MARYLAND", text, re.I)
+    if header_name_match:
+        name = normalize_space(header_name_match.group(1))
+
     for line in lines:
         if line.startswith("Name:"):
             cleaned = re.sub(r"\s+LOYOLA UNIVERSITY MARYLAND.*", "", line)
@@ -272,7 +302,7 @@ def parse_transcript(text: str) -> dict:
             course_rows.append(
                 {
                     "Course ID": code,
-                    "Course Name": normalize_space(raw_title),
+                    "Course Name": clean_course_title(raw_title),
                     "Section": section,
                     "Credits": float(credits),
                     "Grade": grade or "",
@@ -378,7 +408,7 @@ def parse_audit(text: str) -> dict:
             {
                 "Audit Status": canonical_status,
                 "Course ID": code,
-                "Course Name": normalize_space(title),
+                "Course Name": clean_course_title(title),
                 "Requirement Area": current_section,
                 "Requirement Block": block_label,
                 "Requirement Complete": current_block_complete,
@@ -420,7 +450,7 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
             credits_match = credit_pattern.search(line)
             entries[code] = {
                 "Course ID": code,
-                "Catalog Title": normalize_space(title),
+                "Catalog Title": clean_catalog_title(title),
                 "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
             }
 
@@ -951,12 +981,12 @@ with st.sidebar:
     audit_file = st.file_uploader("1. Upload Degree Audit", type="pdf", key="audit")
     transcript_file = st.file_uploader("2. Upload Official Transcript", type="pdf", key="transcript")
     catalog_files = st.file_uploader(
-        "3. Optional Course Catalog PDFs",
+        "3. Upload Course Catalog PDF(s)",
         type="pdf",
         accept_multiple_files=True,
         key="catalogs",
     )
-    st.caption("Catalog PDFs improve titles, credits, and future prerequisite logic.")
+    st.caption("Course catalog upload is required for cleaner titles, credits, and stronger schedule recommendations.")
     ollama_status = get_ollama_status()
     ollama_ready = ollama_status["ok"]
     gemini_status = get_gemini_status()
@@ -985,7 +1015,7 @@ with st.sidebar:
 
 st.title("Loyola AI Schedule Advisor")
 
-if audit_file and transcript_file:
+if audit_file and transcript_file and catalog_files:
     transcript_text = uploaded_pdf_text(transcript_file)
     audit_text = uploaded_pdf_text(audit_file)
 
@@ -1017,6 +1047,9 @@ if audit_file and transcript_file:
         if schedule_df.empty:
             st.success("No remaining courses were detected from the audit.")
         else:
+            summary_text = build_schedule_summary(schedule_df, use_ai and not bool(ai_notes and "fallback used" in str(ai_notes[0]).lower()))
+            if summary_text:
+                st.info(summary_text)
             st.dataframe(schedule_df, use_container_width=True, hide_index=True)
             pdf_bytes = create_pdf(
                 {
@@ -1067,15 +1100,12 @@ if audit_file and transcript_file:
             with st.expander("AI Decisions"):
                 st.dataframe(pd.DataFrame(ai_notes), use_container_width=True, hide_index=True)
 
-    if catalog_files:
-        st.caption(
-            "Catalog enrichment is active. Next step would be parsing prerequisites and term availability from the catalog."
-        )
-    else:
-        st.info("Upload course catalog PDFs if you want better course titles, credits, and later prerequisite checks.")
+    st.caption(
+        "Catalog enrichment is active. Next step would be parsing prerequisites and term availability from the catalog."
+    )
 
 else:
-    st.warning("Upload both the degree audit and transcript PDFs to start the analysis.")
+    st.warning("Upload the degree audit, official transcript, and course catalog PDFs to start the analysis.")
 
 
 st.markdown(
