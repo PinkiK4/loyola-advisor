@@ -308,6 +308,35 @@ def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
     return candidate_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
 
 
+def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
+    selected_rows = []
+    running_credits = 0.0
+    for _, row in pending_df.iterrows():
+        credits = float(row["Credits"])
+        if running_credits + credits > 15:
+            continue
+        selected_rows.append(row)
+        running_credits += credits
+        if running_credits >= 15:
+            break
+
+    selected_df = pd.DataFrame(selected_rows)
+    if selected_df.empty:
+        return pd.DataFrame()
+
+    return selected_df[
+        [
+            "Recommended Term",
+            "Requirement Area",
+            "Requirement Block",
+            "Course ID",
+            "Course Name",
+            "Credits",
+            "Audit Status",
+        ]
+    ].reset_index(drop=True)
+
+
 def get_gemini_api_key() -> str:
     session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
@@ -1107,12 +1136,13 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         ascending=[True, True, True, True, True, True, True, True, True, True],
     )
 
+    ranked_schedule_df = select_ranked_schedule(pending_df)
     ai_notes = []
+    provider = st.session_state.get("ai_provider", "ollama")
     if use_ai:
         try:
-            provider = st.session_state.get("ai_provider", "ollama")
             if provider == "gemini":
-                ai_candidate_df = select_ai_candidate_window(pending_df)
+                ai_candidate_df = select_ai_candidate_window(ranked_schedule_df)
                 optimized_df, schedule_notes = optimize_schedule_with_ai(ai_candidate_df, transcript_data)
                 if ai_schedule_is_valid(ai_candidate_df, optimized_df):
                     pending_df = optimized_df
@@ -1121,6 +1151,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                     ai_notes.append(
                         {"reason": "AI fallback used deterministic ranking because the AI plan dropped required current-term courses."}
                     )
+                    pending_df = ranked_schedule_df
             else:
                 pending_df, interpreter_notes = interpret_requirement_blocks_with_ai(pending_df, transcript_data)
                 ai_notes.extend(interpreter_notes)
@@ -1136,33 +1167,14 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             warning_message = f"AI reasoning fallback used: {exc}"
             st.warning(warning_message)
             ai_notes.append({"reason": warning_message})
+            pending_df = ranked_schedule_df
 
-    selected_rows = []
-    running_credits = 0.0
-    for _, row in pending_df.iterrows():
-        credits = float(row["Credits"])
-        if running_credits + credits > 15:
-            continue
-        selected_rows.append(row)
-        running_credits += credits
-        if running_credits >= 15:
-            break
-
-    pending_df = pd.DataFrame(selected_rows)
+    if not use_ai or provider != "gemini":
+        pending_df = select_ranked_schedule(pending_df)
     if pending_df.empty:
         return pd.DataFrame(), ai_notes
 
-    return pending_df[
-        [
-            "Recommended Term",
-            "Requirement Area",
-            "Requirement Block",
-            "Course ID",
-            "Course Name",
-            "Credits",
-            "Audit Status",
-        ]
-    ].reset_index(drop=True), ai_notes
+    return pending_df.reset_index(drop=True), ai_notes
 
 
 def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
