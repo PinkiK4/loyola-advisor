@@ -12,12 +12,6 @@ import pdfplumber
 import streamlit as st
 from fpdf import FPDF
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-
 st.set_page_config(
     page_title="AI Schedule Advisor | Loyola 2026",
     layout="wide",
@@ -105,8 +99,8 @@ GRADE_TOKENS = {
 }
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 
 def normalize_space(text: str) -> str:
@@ -117,21 +111,21 @@ def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
 
 
-def get_openrouter_api_key() -> str:
-    session_key = st.session_state.get("openrouter_api_key_input", "").strip()
+def get_gemini_api_key() -> str:
+    session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
         return session_key
 
-    env_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    env_key = os.getenv("GEMINI_API_KEY", "").strip()
     if env_key:
         return env_key
 
-    compatibility_key = os.getenv("OPENAI_API_KEY", "").strip()
+    compatibility_key = os.getenv("GOOGLE_API_KEY", "").strip()
     if compatibility_key:
         return compatibility_key
 
     try:
-        secret_key = st.secrets.get("OPENROUTER_API_KEY", "").strip()
+        secret_key = st.secrets.get("GEMINI_API_KEY", "").strip()
     except Exception:
         secret_key = ""
 
@@ -139,24 +133,11 @@ def get_openrouter_api_key() -> str:
         return secret_key
 
     try:
-        compatibility_secret = st.secrets.get("OPENAI_API_KEY", "").strip()
+        compatibility_secret = st.secrets.get("GOOGLE_API_KEY", "").strip()
     except Exception:
         compatibility_secret = ""
 
     return compatibility_secret
-
-
-def get_openrouter_headers() -> dict:
-    headers = {}
-    site_url = os.getenv("OPENROUTER_SITE_URL", "").strip()
-    app_name = os.getenv("OPENROUTER_APP_NAME", "Loyola AI Schedule Advisor").strip()
-
-    if site_url:
-        headers["HTTP-Referer"] = site_url
-    if app_name:
-        headers["X-Title"] = app_name
-
-    return headers
 
 
 def get_course_subject(course_code: str) -> str:
@@ -380,14 +361,11 @@ def get_ollama_status() -> dict:
         }
 
 
-def get_openrouter_status() -> dict:
-    if OpenAI is None:
-        return {"ok": False, "message": "Install the openai package to use OpenRouter."}
+def get_gemini_status() -> dict:
+    if not get_gemini_api_key():
+        return {"ok": False, "message": "Add a Gemini API key in the sidebar or environment."}
 
-    if not get_openrouter_api_key():
-        return {"ok": False, "message": "Add an OpenRouter API key in the sidebar or environment."}
-
-    return {"ok": True, "message": f"Ready to use {OPENROUTER_MODEL} via OpenRouter."}
+    return {"ok": True, "message": f"Ready to use {GEMINI_MODEL} via Gemini API."}
 
 
 def call_ollama_json(model: str, system_prompt: str, user_payload: dict) -> dict:
@@ -418,35 +396,62 @@ def call_ollama_json(model: str, system_prompt: str, user_payload: dict) -> dict
         return json.loads(payload["response"])
 
 
-def call_openrouter_json(model: str, system_prompt: str, user_payload: dict) -> dict:
-    api_key = get_openrouter_api_key()
+def call_gemini_json(model: str, system_prompt: str, user_payload: dict) -> dict:
+    api_key = get_gemini_api_key()
     if not api_key:
-        raise RuntimeError("No OpenRouter API key is available.")
-    if OpenAI is None:
-        raise RuntimeError("The openai package is not installed.")
+        raise RuntimeError("No Gemini API key is available.")
 
-    client = OpenAI(api_key=api_key, base_url=OPENROUTER_URL)
-    prompt = (
-        f"{system_prompt}\n\n"
-        "Return valid JSON only. Do not include markdown fences.\n\n"
-        f"{json.dumps(user_payload, ensure_ascii=True)}"
+    body = json.dumps(
+        {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}],
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "Return valid JSON only. Do not include markdown fences.\n\n"
+                                f"{json.dumps(user_payload, ensure_ascii=True)}"
+                            )
+                        }
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GEMINI_URL}/models/{model}:generateContent?key={api_key}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
+
     try:
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-            extra_headers=get_openrouter_headers(),
-        )
-        return json.loads((response.output_text or "").strip())
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        candidate = (payload.get("candidates") or [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(part.get("text", "") for part in parts).strip()
+        return json.loads(text)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini request failed: HTTP {exc.code}: {detail}") from exc
     except Exception as exc:
-        raise RuntimeError(f"OpenRouter request failed: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f"Gemini request failed: {type(exc).__name__}: {exc}") from exc
 
 
 def call_ai_json(system_prompt: str, user_payload: dict) -> dict:
     provider = st.session_state.get("ai_provider", "ollama")
-    if provider == "openrouter":
-        return call_openrouter_json(
-            model=st.session_state.get("openrouter_model", OPENROUTER_MODEL),
+    if provider == "gemini":
+        return call_gemini_json(
+            model=st.session_state.get("gemini_model", GEMINI_MODEL),
             system_prompt=system_prompt,
             user_payload=user_payload,
         )
@@ -726,16 +731,23 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     ai_notes = []
     if use_ai:
         try:
-            pending_df, interpreter_notes = interpret_requirement_blocks_with_ai(pending_df, transcript_data)
-            ai_notes.extend(interpreter_notes)
-
-            pending_df, track_lock_notes = refine_track_locks_with_ai(pending_df, transcript_data)
-            ai_notes.extend(track_lock_notes)
-
-            optimized_df, schedule_notes = optimize_schedule_with_ai(pending_df, transcript_data)
-            if not optimized_df.empty:
-                pending_df = optimized_df
+            provider = st.session_state.get("ai_provider", "ollama")
+            if provider == "gemini":
+                optimized_df, schedule_notes = optimize_schedule_with_ai(pending_df, transcript_data)
+                if not optimized_df.empty:
+                    pending_df = optimized_df
                 ai_notes.extend(schedule_notes)
+            else:
+                pending_df, interpreter_notes = interpret_requirement_blocks_with_ai(pending_df, transcript_data)
+                ai_notes.extend(interpreter_notes)
+
+                pending_df, track_lock_notes = refine_track_locks_with_ai(pending_df, transcript_data)
+                ai_notes.extend(track_lock_notes)
+
+                optimized_df, schedule_notes = optimize_schedule_with_ai(pending_df, transcript_data)
+                if not optimized_df.empty:
+                    pending_df = optimized_df
+                    ai_notes.extend(schedule_notes)
         except Exception as exc:
             warning_message = f"AI reasoning fallback used: {exc}"
             st.warning(warning_message)
@@ -803,16 +815,16 @@ def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
 
 with st.sidebar:
     st.header("Document Center")
-    provider_options = ["OpenRouter", "Ollama"]
+    provider_options = ["Gemini", "Ollama"]
     provider = st.selectbox("AI provider", provider_options, index=0)
     st.session_state["ai_provider"] = provider.lower()
 
-    openrouter_model = st.text_input("OpenRouter model", value=os.getenv("OPENROUTER_MODEL", OPENROUTER_MODEL))
-    st.session_state["openrouter_model"] = openrouter_model
+    gemini_model = st.text_input("Gemini model", value=os.getenv("GEMINI_MODEL", GEMINI_MODEL))
+    st.session_state["gemini_model"] = gemini_model
     st.text_input(
-        "OpenRouter API Key",
+        "Gemini API Key",
         type="password",
-        key="openrouter_api_key_input",
+        key="gemini_api_key_input",
         help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
     )
 
@@ -830,17 +842,17 @@ with st.sidebar:
     st.session_state["ollama_model"] = ollama_model
     ollama_status = get_ollama_status()
     ollama_ready = ollama_status["ok"]
-    openrouter_status = get_openrouter_status()
-    openrouter_ready = openrouter_status["ok"]
-    ai_ready = openrouter_ready if provider == "OpenRouter" else ollama_ready
+    gemini_status = get_gemini_status()
+    gemini_ready = gemini_status["ok"]
+    ai_ready = gemini_ready if provider == "Gemini" else ollama_ready
     use_ai = st.toggle(
         "Use AI reasoning",
         value=ai_ready,
         help="Uses the selected AI provider for track selection and final schedule optimization.",
         disabled=not ai_ready,
     )
-    if provider == "OpenRouter":
-        st.caption(openrouter_status["message"])
+    if provider == "Gemini":
+        st.caption(gemini_status["message"])
     else:
         if not ollama_ready:
             st.caption("Start Ollama locally to enable model-based track selection and schedule optimization.")
