@@ -294,6 +294,20 @@ def build_schedule_summary(schedule_df: pd.DataFrame, ai_enabled: bool) -> str:
     return f"{intro}: " + ", ".join(course_bits) + "."
 
 
+def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
+    if pending_df.empty:
+        return pending_df
+
+    current_term_df = pending_df[pending_df["Recommended Term"] == "Current Term"].copy()
+    if current_term_df.empty:
+        return pending_df.head(8).copy()
+
+    remaining_slots = max(0, 8 - len(current_term_df))
+    next_term_df = pending_df[pending_df["Recommended Term"] != "Current Term"].head(remaining_slots).copy()
+    candidate_df = pd.concat([current_term_df, next_term_df], ignore_index=True)
+    return candidate_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+
+
 def get_gemini_api_key() -> str:
     session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
@@ -915,6 +929,9 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
     if pending_df.empty:
         return pending_df, []
 
+    required_current_ids = pending_df.loc[
+        pending_df["Recommended Term"] == "Current Term", "Course ID"
+    ].tolist()
     candidates = pending_df[
         [
             "Course ID",
@@ -935,6 +952,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
             "completed_courses": sorted(transcript_data["taken_codes"]),
         },
+        "required_current_course_ids": required_current_ids,
         "candidate_courses": candidates,
         "output_schema": {
             "selected_course_ids": ["string"],
@@ -947,11 +965,21 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "You are the main decision engine for a college schedule planner. "
             "Choose the strongest next-semester schedule from the candidate courses. "
             "Keep the total at or under 15 credits, prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
-            "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong."
+            "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
+            "You MUST include every course in required_current_course_ids in selected_course_ids. "
+            "Only use other courses to fill remaining room after all required_current_course_ids are included."
         ),
         user_payload=prompt,
     )
-    selected_ids = result.get("selected_course_ids", [])
+    raw_selected_ids = result.get("selected_course_ids", [])
+    selected_ids = []
+    for course_id in required_current_ids + raw_selected_ids:
+        if course_id in pending_df["Course ID"].values and course_id not in selected_ids:
+            selected_ids.append(course_id)
+
+    if not selected_ids:
+        selected_ids = pending_df["Course ID"].tolist()
+
     selected_df = pending_df[pending_df["Course ID"].isin(selected_ids)].copy()
     selected_df["ai_rank"] = selected_df["Course ID"].apply(
         lambda course_id: selected_ids.index(course_id) if course_id in selected_ids else 999
@@ -968,6 +996,17 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         running_credits += credits
 
     return pd.DataFrame(kept_rows), result.get("rationales", [])
+
+
+def ai_schedule_is_valid(candidate_df: pd.DataFrame, optimized_df: pd.DataFrame) -> bool:
+    if candidate_df.empty or optimized_df.empty:
+        return False
+
+    required_current_ids = set(
+        candidate_df.loc[candidate_df["Recommended Term"] == "Current Term", "Course ID"].tolist()
+    )
+    optimized_ids = set(optimized_df["Course ID"].tolist())
+    return required_current_ids.issubset(optimized_ids)
 
 
 def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame, use_ai: bool = False):
@@ -1073,10 +1112,15 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         try:
             provider = st.session_state.get("ai_provider", "ollama")
             if provider == "gemini":
-                optimized_df, schedule_notes = optimize_schedule_with_ai(pending_df, transcript_data)
-                if not optimized_df.empty:
+                ai_candidate_df = select_ai_candidate_window(pending_df)
+                optimized_df, schedule_notes = optimize_schedule_with_ai(ai_candidate_df, transcript_data)
+                if ai_schedule_is_valid(ai_candidate_df, optimized_df):
                     pending_df = optimized_df
-                ai_notes.extend(schedule_notes)
+                    ai_notes.extend(schedule_notes)
+                else:
+                    ai_notes.append(
+                        {"reason": "AI fallback used deterministic ranking because the AI plan dropped required current-term courses."}
+                    )
             else:
                 pending_df, interpreter_notes = interpret_requirement_blocks_with_ai(pending_df, transcript_data)
                 ai_notes.extend(interpreter_notes)
