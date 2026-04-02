@@ -456,6 +456,9 @@ def parse_transcript(text: str) -> dict:
         name = normalize_space(header_name_match.group(1))
 
     for line in lines:
+        if "NOT FOR OFFICIAL USE" in line or "This may not be a comprehensive" in line:
+            continue
+
         if line.startswith("Name:"):
             cleaned = re.sub(r"\s+LOYOLA UNIVERSITY MARYLAND.*", "", line)
             name = cleaned.replace("Name:", "", 1).strip() or name
@@ -517,6 +520,38 @@ def parse_transcript(text: str) -> dict:
         "taken_codes": taken_codes,
         "in_progress_codes": in_progress_codes,
     }
+
+
+def build_completion_state(transcript_data: dict, audit_data: dict) -> dict:
+    earned_credits = float(transcript_data["total"] or 0)
+    in_progress_codes = set(transcript_data["in_progress_codes"])
+    requirements_df = audit_data["requirements_df"]
+
+    if requirements_df.empty:
+        return {"is_complete": False, "message": ""}
+
+    remaining_required_df = requirements_df[
+        (requirements_df["Requirement Complete"] != True)
+        & (requirements_df["Audit Status"] == "Not Started")
+    ].copy()
+
+    has_credit_target = earned_credits >= 111
+    has_no_not_started_requirements = remaining_required_df.empty
+    is_capstone_only = in_progress_codes and in_progress_codes.issubset({"DS 496", "IS 358", "IS 420", "SN 104", "ST 472"})
+
+    if has_credit_target and has_no_not_started_requirements:
+        return {
+            "is_complete": True,
+            "message": "Congratulations! Your transcript and audit indicate that your remaining requirements are already satisfied or fully in progress for graduation.",
+        }
+
+    if has_credit_target and is_capstone_only and len(in_progress_codes) <= 5:
+        return {
+            "is_complete": True,
+            "message": "Congratulations! You appear to be at the finish line with only your final in-progress graduation plan remaining.",
+        }
+
+    return {"is_complete": False, "message": ""}
 
 
 def parse_audit(text: str) -> dict:
@@ -1273,6 +1308,7 @@ if audit_file and transcript_file and catalog_files:
     transcript_data = parse_transcript(transcript_text)
     audit_data = parse_audit(audit_text)
     catalog_df = parse_catalogs(catalog_files or [])
+    completion_state = build_completion_state(transcript_data, audit_data)
     schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
 
     transcript_gpa = transcript_data["qpa"]
@@ -1294,10 +1330,23 @@ if audit_file and transcript_file and catalog_files:
     left_col, right_col = st.columns([2, 1])
 
     with left_col:
-        st.subheader("Recommended Schedule")
-        if schedule_df.empty:
+        if completion_state["is_complete"]:
+            st.subheader("Graduation Status")
+            st.success(completion_state["message"])
+            st.markdown(
+                f"""
+                <div class="info-card" style="background-color: rgba(32, 92, 54, 0.92); border-left: 5px solid #5dd67a;">
+                    <b>Congratulations, {transcript_data['name']}!</b><br>
+                    You have earned {transcript_data['total']} credits and your degree audit appears complete enough for graduation review.
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        elif schedule_df.empty:
+            st.subheader("Recommended Schedule")
             st.success("No remaining courses were detected from the audit.")
         else:
+            st.subheader("Recommended Schedule")
             summary_text = build_schedule_summary(schedule_df, use_ai and not bool(ai_notes and "fallback used" in str(ai_notes[0]).lower()))
             if summary_text:
                 st.info(summary_text)
@@ -1323,7 +1372,7 @@ if audit_file and transcript_file and catalog_files:
         st.metric("Transcript GPA", transcript_gpa)
         st.metric("Audit GPA", audit_gpa)
         st.metric("Transcript Courses Found", len(transcript_data["courses_df"]))
-        st.metric("Remaining Audit Courses", len(schedule_df))
+        st.metric("Remaining Audit Courses", 0 if completion_state["is_complete"] else len(schedule_df))
         st.metric("Suggested Credits", int(schedule_df["Credits"].sum()) if not schedule_df.empty else 0)
         st.metric("Catalog Matches", int(schedule_df["Course Name"].notna().sum()) if not schedule_df.empty else 0)
 
