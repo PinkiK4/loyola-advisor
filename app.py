@@ -340,12 +340,24 @@ def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
 def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     selected_rows = []
     running_credits = 0.0
+    block_counts = {}
     for _, row in pending_df.iterrows():
         credits = float(row["Credits"])
+        block_label = str(row.get("Requirement Block", ""))
+        block_limit = row.get("Block Remaining", 1)
+        try:
+            block_limit = int(block_limit) if pd.notna(block_limit) else 1
+        except Exception:
+            block_limit = 1
+        block_limit = max(block_limit, 1)
+
+        if block_counts.get(block_label, 0) >= block_limit:
+            continue
         if running_credits + credits > 15:
             continue
         selected_rows.append(row)
         running_credits += credits
+        block_counts[block_label] = block_counts.get(block_label, 0) + 1
         if running_credits >= 15:
             break
 
