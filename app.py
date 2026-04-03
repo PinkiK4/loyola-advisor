@@ -625,6 +625,12 @@ def build_completion_state(transcript_data: dict, audit_data: dict, display_majo
         and in_progress_codes.issubset({"DS 496", "IS 358", "IS 420", "SN 104", "ST 472"})
     )
 
+    if has_credit_target and has_no_remaining_schedule:
+        return {
+            "is_complete": True,
+            "message": "Congratulations! Your transcript and selected degree path appear complete enough for graduation review.",
+        }
+
     if has_credit_target and has_no_not_started_requirements and has_no_remaining_schedule:
         return {
             "is_complete": True,
@@ -867,6 +873,40 @@ def row_matches_block_subject(row: pd.Series) -> bool:
         return True
 
     return subject in allowed_subjects
+
+
+def drop_block_alternatives_covered_by_in_progress(
+    pending_df: pd.DataFrame, requirements_df: pd.DataFrame, transcript_data: dict
+) -> pd.DataFrame:
+    if pending_df.empty or requirements_df.empty:
+        return pending_df
+
+    covered_blocks = set()
+    in_progress_codes = set(transcript_data["in_progress_codes"])
+
+    for requirement_block, group in requirements_df.groupby("Requirement Block", dropna=False):
+        block_remaining = group["Block Remaining"].dropna()
+        if block_remaining.empty:
+            continue
+
+        try:
+            remaining_needed = int(block_remaining.iloc[0])
+        except Exception:
+            continue
+
+        if remaining_needed <= 0:
+            continue
+
+        in_progress_count = int(group["Course ID"].isin(in_progress_codes).sum())
+        if in_progress_count >= remaining_needed:
+            covered_blocks.add(requirement_block)
+
+    if not covered_blocks:
+        return pending_df
+
+    return pending_df[
+        ~pending_df["Requirement Block"].isin(covered_blocks)
+    ].copy()
 
 
 def get_ollama_status() -> dict:
@@ -1299,6 +1339,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
+    pending_df = drop_block_alternatives_covered_by_in_progress(pending_df, requirements_df, transcript_data)
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
 
     overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
