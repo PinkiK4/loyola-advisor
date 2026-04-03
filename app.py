@@ -1343,6 +1343,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
 
     overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
+    if pending_df.empty:
+        empty_df = pd.DataFrame()
+        empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
+        empty_df.attrs["catalog_usable"] = overlap["usable"]
+        return empty_df, []
+
     if overlap["usable"]:
         pending_df = pending_df.merge(catalog_df, on="Course ID", how="left")
         pending_df["Course Name"] = pending_df["Catalog Title"].fillna(pending_df["Course Name"])
@@ -1392,6 +1398,11 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             transcript_data["taken_codes"].union(transcript_data["in_progress_codes"])
         )
     ].copy()
+    if pending_df.empty:
+        empty_df = pd.DataFrame()
+        empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
+        empty_df.attrs["catalog_usable"] = overlap["usable"]
+        return empty_df, []
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df["Sequence Priority"] = pending_df["Course ID"].apply(
         lambda code: sequence_gap_priority(code, transcript_data)
