@@ -505,7 +505,7 @@ def parse_transcript(text: str) -> dict:
 
     term_heading_pattern = re.compile(r"^(Fall|Spring|Summer|Winter)\s+\d{2}$", re.I)
     course_pattern = re.compile(
-        r"^([A-Z]{2,4})\s+(\d{3})\s+([A-Z0-9]{2,3})\s*(.+?)\s+(\d+\.\d{2})(?:\s+([A-Z][+-]?|CIP|IP|P|S|U|W|AU))?$"
+        r"([A-Z]{2,4})\s+(\d{3})\s+([A-Z0-9]{2,3})\s+(.+?)\s+(\d+\.\d{2})(?:\s+([A-Z][+-]?|CIP|IP|P|S|U|W|AU))(?=(?:\s+[A-Z]{2,4}\s+\d{3}\s+[A-Z0-9]{2,3}\s)|\s+Term CA:|\s+Total CA:|$)"
     )
 
     header_name_match = re.search(r"Name:\s*(.+?)\s+LOYOLA UNIVERSITY MARYLAND", text, re.I)
@@ -544,8 +544,7 @@ def parse_transcript(text: str) -> dict:
         if term_heading_pattern.match(line):
             current_term = line
 
-        course_match = course_pattern.match(line)
-        if course_match:
+        for course_match in course_pattern.finditer(line):
             subject, number, section, raw_title, credits, grade = course_match.groups()
             code = normalize_course_code(subject, number)
             course_rows.append(
