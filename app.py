@@ -500,6 +500,10 @@ def parse_transcript(text: str) -> dict:
     if header_name_match:
         name = normalize_space(header_name_match.group(1))
 
+    header_sid_match = re.search(r"I\.D\.No\.:\s*(\d{5,10})", text, re.I)
+    if header_sid_match:
+        sid = header_sid_match.group(1)
+
     for line in lines:
         if "NOT FOR OFFICIAL USE" in line or "This may not be a comprehensive" in line:
             continue
@@ -611,7 +615,7 @@ def parse_audit(text: str) -> dict:
     language_placeholder_added = False
     section_pattern = re.compile(r"^[A-Z][A-Za-z/&,\-\s]{3,}$")
     course_line_pattern = re.compile(
-        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})\s+(.+)$",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})(?:\s+(.+))?$",
         re.I,
     )
     block_progress_pattern = re.compile(
@@ -686,12 +690,12 @@ def parse_audit(text: str) -> dict:
             continue
 
         status, subject, number, title = match.groups()
-        cleaned_title = clean_course_title(title)
+        cleaned_title = clean_course_title(title or "")
         if cleaned_title in GRADE_TOKENS:
             continue
         code = normalize_course_code(subject, number)
         canonical_status = canonicalize_audit_status(status)
-        audit_term = parse_audit_term_code(title)
+        audit_term = parse_audit_term_code(title or "")
         block_label = current_block or "Degree Requirement"
         block_lower = block_label.lower()
         is_elective_block = "choose from" in block_lower or re.search(r"complete\s+\d+\s+courses", block_lower) is not None
@@ -699,7 +703,7 @@ def parse_audit(text: str) -> dict:
             {
                 "Audit Status": canonical_status,
                 "Course ID": code,
-                "Course Name": cleaned_title,
+                "Course Name": cleaned_title or code,
                 "Audit Term": audit_term,
                 "Requirement Area": current_section,
                 "Requirement Block": block_label,
