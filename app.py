@@ -1347,6 +1347,11 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         axis=1,
     )
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
+    pending_df = pending_df[
+        ~pending_df["Course ID"].isin(
+            transcript_data["taken_codes"].union(transcript_data["in_progress_codes"])
+        )
+    ].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df["Sequence Priority"] = pending_df["Course ID"].apply(
         lambda code: sequence_gap_priority(code, transcript_data)
