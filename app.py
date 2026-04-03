@@ -583,7 +583,26 @@ def parse_transcript(text: str) -> dict:
     }
 
 
-def build_completion_state(transcript_data: dict, audit_data: dict) -> dict:
+def derive_program_major(audit_text: str, catalog_files, transcript_major: str) -> str:
+    majors_match = re.search(r"^Majors:\s*(.+)$", audit_text, re.I | re.M)
+    specializations_match = re.search(r"^Specializations:\s*(.+)$", audit_text, re.I | re.M)
+    if majors_match and specializations_match:
+        return f"{normalize_space(majors_match.group(1))}, {normalize_space(specializations_match.group(1))}"
+    if majors_match:
+        return normalize_space(majors_match.group(1))
+
+    for catalog_file in catalog_files or []:
+        catalog_text = uploaded_pdf_text(catalog_file)
+        program_match = re.search(r"^Program:\s*(.+)$", catalog_text, re.I | re.M)
+        if program_match:
+            program_name = normalize_space(program_match.group(1))
+            program_name = re.sub(r"\s*-\s*Loyola University Maryland.*$", "", program_name, flags=re.I)
+            return program_name
+
+    return transcript_major if transcript_major and transcript_major != "Unknown" else "Unknown"
+
+
+def build_completion_state(transcript_data: dict, audit_data: dict, display_major: str, schedule_df: pd.DataFrame | None = None) -> dict:
     earned_credits = float(transcript_data["total"] or 0)
     in_progress_codes = set(transcript_data["in_progress_codes"])
     requirements_df = audit_data["requirements_df"]
@@ -598,15 +617,22 @@ def build_completion_state(transcript_data: dict, audit_data: dict) -> dict:
 
     has_credit_target = earned_credits >= 111
     has_no_not_started_requirements = remaining_required_df.empty
-    is_capstone_only = in_progress_codes and in_progress_codes.issubset({"DS 496", "IS 358", "IS 420", "SN 104", "ST 472"})
+    has_no_remaining_schedule = schedule_df is None or schedule_df.empty
+    major_label = (display_major or "").lower()
+    is_data_science_path = "data science" in major_label
+    is_capstone_only = (
+        is_data_science_path
+        and in_progress_codes
+        and in_progress_codes.issubset({"DS 496", "IS 358", "IS 420", "SN 104", "ST 472"})
+    )
 
-    if has_credit_target and has_no_not_started_requirements:
+    if has_credit_target and has_no_not_started_requirements and has_no_remaining_schedule:
         return {
             "is_complete": True,
             "message": "Congratulations! Your transcript and audit indicate that your remaining requirements are already satisfied or fully in progress for graduation.",
         }
 
-    if has_credit_target and is_capstone_only and len(in_progress_codes) <= 5:
+    if has_credit_target and is_capstone_only and len(in_progress_codes) <= 5 and has_no_remaining_schedule:
         return {
             "is_complete": True,
             "message": "Congratulations! You appear to be at the finish line with only your final in-progress graduation plan remaining.",
@@ -1481,8 +1507,10 @@ if audit_file and transcript_file and catalog_files:
     transcript_data = parse_transcript(transcript_text)
     audit_data = parse_audit(audit_text)
     catalog_df = parse_catalogs(catalog_files or [])
-    completion_state = build_completion_state(transcript_data, audit_data)
+    display_major = derive_program_major(audit_text, catalog_files or [], transcript_data["major"])
+    transcript_data["major"] = display_major
     schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
+    completion_state = build_completion_state(transcript_data, audit_data, display_major, schedule_df)
 
     transcript_gpa = transcript_data["qpa"]
     audit_gpa = audit_data["audit_gpa"]
