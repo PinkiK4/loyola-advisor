@@ -805,6 +805,33 @@ def infer_language_subject(transcript_data: dict) -> str | None:
     return str(counts.index[0]) if not counts.empty else None
 
 
+def extract_allowed_subjects(requirement_block: str) -> set[str]:
+    block = str(requirement_block or "")
+    subjects = set()
+    for match in re.finditer(r"\b([A-Z]{2,4})\s*\d{3}\b", block):
+        subjects.add(match.group(1))
+    for match in re.finditer(r"\b([A-Z]{2,4})\s+\d{3}-", block):
+        subjects.add(match.group(1))
+    return subjects
+
+
+def row_matches_block_subject(row: pd.Series) -> bool:
+    course_id = str(row.get("Course ID", ""))
+    course_name = str(row.get("Course Name", ""))
+    requirement_block = str(row.get("Requirement Block", ""))
+    subject = get_course_subject(course_id)
+    allowed_subjects = extract_allowed_subjects(requirement_block)
+
+    if not allowed_subjects:
+        return True
+
+    # Be strict only for placeholder/no-title rows. Real titled rows can still be valid alternates.
+    if course_name != course_id:
+        return True
+
+    return subject in allowed_subjects
+
+
 def get_ollama_status() -> dict:
     try:
         request = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
@@ -1234,6 +1261,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     ].copy()
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
 
     overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
