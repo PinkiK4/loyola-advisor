@@ -408,14 +408,30 @@ def should_merge_pdf_line(previous_line: str, current_line: str) -> bool:
     if not previous or not current:
         return False
 
+    previous_structural_patterns = [
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+[A-Z]{2,4}\*?\d{3}\b",
+        r"^(Transfer Equivalency)\s+[A-Z]{2,4}\*?\d{3}\b",
+        r"^https?://",
+        r"^My Progress\b",
+        r"^Page\s+\d+\s+of\s+\d+",
+        r"^[-=]{3,}$",
+    ]
+    if any(re.match(pattern, previous, re.I) for pattern in previous_structural_patterns):
+        return False
+
     structural_patterns = [
         r"^(Fall|Spring|Summer|Winter)\s+\d{2}$",
-        r"^(Status|Total|Term|Degree|Major|Catalog|Description|Requirements)\b",
+        r"^(Status|Total|Term|Degree|Major|Catalog|Description|Requirements|Progress|Specializations|Departments|Majors)\b",
         r"^\d+\.\s+",
+        r"^[A-Z]\.\s+",
         r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\b",
+        r"^(Transfer Equivalency)\b",
         r"^[A-Z]{2,4}\*?\s*\d{3}\b",
         r"^Page:\s+\d+",
+        r"^Page\s+\d+\s+of\s+\d+",
+        r"^My Progress\b",
         r"^https?://",
+        r"^©\s*\d{4}",
         r"^[-=]{3,}$",
     ]
     if any(re.match(pattern, current, re.I) for pattern in structural_patterns):
