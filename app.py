@@ -337,10 +337,17 @@ def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
 
     current_term_df = pending_df[pending_df["Recommended Term"] == "Current Term"].copy()
     if current_term_df.empty:
-        return pending_df.head(8).copy()
+        next_term_df = pending_df.copy()
+        next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
+        next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
+        return next_term_df.head(6).copy()
 
-    remaining_slots = max(0, 8 - len(current_term_df))
-    next_term_df = pending_df[pending_df["Recommended Term"] != "Current Term"].head(remaining_slots).copy()
+    remaining_slots = max(0, 6 - len(current_term_df))
+    next_term_df = pending_df[pending_df["Recommended Term"] != "Current Term"].copy()
+    if not next_term_df.empty:
+        next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
+        next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
+    next_term_df = next_term_df.head(remaining_slots).copy()
     candidate_df = pd.concat([current_term_df, next_term_df], ignore_index=True)
     return candidate_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
 
@@ -1323,7 +1330,10 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
     kept_rows = []
     for _, row in selected_df.iterrows():
         credits = float(row["Credits"])
-        if running_credits + credits > 15:
+        if (
+            row["Course ID"] not in required_current_ids
+            and running_credits + credits > 15
+        ):
             continue
         kept_rows.append(row)
         running_credits += credits
@@ -1339,7 +1349,8 @@ def ai_schedule_is_valid(candidate_df: pd.DataFrame, optimized_df: pd.DataFrame)
         candidate_df.loc[candidate_df["Recommended Term"] == "Current Term", "Course ID"].tolist()
     )
     optimized_ids = set(optimized_df["Course ID"].tolist())
-    return required_current_ids.issubset(optimized_ids)
+    candidate_ids = set(candidate_df["Course ID"].tolist())
+    return required_current_ids.issubset(optimized_ids) and optimized_ids.issubset(candidate_ids)
 
 
 def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame, use_ai: bool = False):
