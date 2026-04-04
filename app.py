@@ -331,6 +331,24 @@ def build_empty_schedule(overlap: dict | None = None) -> pd.DataFrame:
     return empty_df
 
 
+def infer_block_remaining(row: pd.Series) -> int:
+    raw_value = row.get("Block Remaining", None)
+    if pd.notna(raw_value):
+        try:
+            return max(int(raw_value), 1)
+        except Exception:
+            pass
+
+    block_label = str(row.get("Requirement Block", ""))
+    progress_match = re.search(r"(\d+)\s+of\s+(\d+)\s+Courses\s+Completed", block_label, re.I)
+    if progress_match:
+        completed = int(progress_match.group(1))
+        total = int(progress_match.group(2))
+        return max(total - completed, 1)
+
+    return 1
+
+
 def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
     if schedule_df.empty:
         return pd.DataFrame()
@@ -1448,7 +1466,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df["Term Sort"] = pending_df["Recommended Term"].apply(
         lambda term: term_sort_key(term) if term_sort_key(term) is not None else (99, 99)
     )
-    pending_df["Block Remaining"] = pending_df["Block Remaining"].fillna(1)
+    pending_df["Block Remaining"] = pending_df.apply(infer_block_remaining, axis=1)
     pending_df["Block Order"] = pending_df["Block Order"].fillna(999)
     pending_df["Is Elective Block"] = pending_df["Is Elective Block"].fillna(False)
     pending_df["Block Priority"] = pending_df["Is Elective Block"].map({False: 0, True: 1}).fillna(1)
