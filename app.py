@@ -133,6 +133,7 @@ def clean_course_title(title: str) -> str:
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b$", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.rstrip(" -,:;")
 
@@ -438,6 +439,31 @@ def infer_block_remaining(row: pd.Series) -> int:
     return 1
 
 
+def clean_requirement_area_label(area: str) -> str:
+    cleaned = normalize_space(area or "")
+    replacements = {
+        "Persp on Suffering": "University Core",
+        "Sci thrh Programmin g": "Data Science Core",
+        "Sci thrh Programming": "Data Science Core",
+        "Photography": "University Core",
+        "Statistics": "Data Science Core",
+        "Intellig&Data Mining": "Data Science Core",
+        "Multivariate Analysis": "Data Science Core",
+        "Matters": "University Core",
+    }
+    return replacements.get(cleaned, cleaned)
+
+
+def clean_requirement_block_label(block: str) -> str:
+    cleaned = normalize_space(block or "")
+    cleaned = re.sub(r"\bFulfi\s*lled\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b\d+\s+of\s+\d+\s+Courses\s+Completed\.?", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b\d+\s+of\s+\d+\s+Credits\s+Completed\.?", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bHide Details\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.strip(" .")
+
+
 def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
     if schedule_df.empty:
         return pd.DataFrame()
@@ -453,6 +479,9 @@ def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
             "Audit Status",
         ]
     ].reset_index(drop=True)
+    output_df["Requirement Area"] = output_df["Requirement Area"].apply(clean_requirement_area_label)
+    output_df["Requirement Block"] = output_df["Requirement Block"].apply(clean_requirement_block_label)
+    output_df["Course Name"] = output_df["Course Name"].apply(clean_course_title)
     output_df.attrs["catalog_overlap_count"] = schedule_df.attrs.get("catalog_overlap_count", 0)
     output_df.attrs["catalog_usable"] = schedule_df.attrs.get("catalog_usable", False)
     return output_df
