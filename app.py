@@ -355,15 +355,22 @@ def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
     if pending_df.empty:
         return pending_df
 
+    if "Future Audit Snapshot" in pending_df.columns:
+        non_future_df = pending_df[pending_df["Future Audit Snapshot"] != True].copy()
+    else:
+        non_future_df = pending_df.copy()
+
     current_term_df = pending_df[pending_df["Recommended Term"] == "Current Term"].copy()
     if current_term_df.empty:
-        next_term_df = pending_df.copy()
+        source_df = non_future_df if not non_future_df.empty else pending_df
+        next_term_df = source_df.copy()
         next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
         next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
         return next_term_df.head(6).copy()
 
     remaining_slots = max(0, 6 - len(current_term_df))
-    next_term_df = pending_df[pending_df["Recommended Term"] != "Current Term"].copy()
+    source_df = non_future_df if not non_future_df.empty else pending_df
+    next_term_df = source_df[source_df["Recommended Term"] != "Current Term"].copy()
     if not next_term_df.empty:
         next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
         next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
@@ -1392,10 +1399,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     )
     incomplete_mask = (pending_df["Requirement Complete"] != True) | future_term_mask
     pending_df = pending_df[incomplete_mask & pending_mask].copy()
+    pending_df["Future Audit Snapshot"] = future_term_mask.reindex(pending_df.index, fill_value=False)
     pending_df = pending_df[
         ~pending_df["Audit Status"].astype(str).str.contains(r"Completed|Fulfi\s*lled|Fulfilled", case=False, na=False)
         | pending_df["Course ID"].isin(["LANG 104"])
     ].copy()
+    pending_df.loc[pending_df["Future Audit Snapshot"] == True, "Audit Status"] = "Not Started"
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
@@ -1423,6 +1432,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                 row["Course ID"] in transcript_data["in_progress_codes"]
                 or (
                     row["Audit Status"] == "In Progress"
+                    and not bool(row.get("Future Audit Snapshot", False))
                     and (
                         latest_transcript_index is None
                         or row["Audit Term Index"] is None
@@ -1442,6 +1452,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df["Block Order"] = pending_df["Block Order"].fillna(999)
     pending_df["Is Elective Block"] = pending_df["Is Elective Block"].fillna(False)
     pending_df["Block Priority"] = pending_df["Is Elective Block"].map({False: 0, True: 1}).fillna(1)
+    pending_df["Snapshot Priority"] = pending_df["Future Audit Snapshot"].map({False: 0, True: 1}).fillna(1)
     pending_df["Requirement Priority"] = pending_df.apply(
         lambda row: requirement_category_priority(
             row["Requirement Area"],
@@ -1466,6 +1477,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = pending_df.sort_values(
         by=[
             "Priority",
+            "Snapshot Priority",
             "Requirement Priority",
             "Sequence Priority",
             "Term Sort",
@@ -1476,7 +1488,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
