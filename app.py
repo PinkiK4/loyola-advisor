@@ -458,6 +458,18 @@ def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
     return output_df
 
 
+def sanitized_requirement_block_label(row: pd.Series) -> str:
+    block_label = str(row.get("Requirement Block", ""))
+    if not bool(row.get("Future Audit Snapshot", False)):
+        return block_label
+
+    sanitized = re.sub(r"\bFulfi\s*lled\b", "", block_label, flags=re.I)
+    sanitized = re.sub(r"\b\d+\s+of\s+\d+\s+Courses\s+Completed\.?", "", sanitized, flags=re.I)
+    sanitized = re.sub(r"\b\d+\s+of\s+\d+\s+Credits\s+Completed\.?", "", sanitized, flags=re.I)
+    sanitized = re.sub(r"\s{2,}", " ", sanitized)
+    return sanitized.strip(" .")
+
+
 def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
     if pending_df.empty:
         return pending_df
@@ -1407,11 +1419,14 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "Course Name",
             "Credits",
             "Requirement Area",
-            "Requirement Block",
             "Recommended Term",
             "Audit Status",
         ]
-    ].to_dict(orient="records")
+    ].copy()
+    candidates["Requirement Block"] = pending_df.apply(sanitized_requirement_block_label, axis=1)
+    if "Future Audit Snapshot" in pending_df.columns:
+        candidates["Future Audit Snapshot"] = pending_df["Future Audit Snapshot"].fillna(False)
+    candidate_records = candidates.to_dict(orient="records")
 
     prompt = {
         "student": {
@@ -1422,7 +1437,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "completed_courses": sorted(transcript_data["taken_codes"]),
         },
         "required_current_course_ids": required_current_ids,
-        "candidate_courses": candidates,
+        "candidate_courses": candidate_records,
         "output_schema": {
             "selected_course_ids": ["string"],
             "rationales": [{"course_id": "string", "reason": "string"}],
@@ -1433,10 +1448,12 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         system_prompt=(
             "You are the main decision engine for a college schedule planner. "
             "Choose the strongest next-semester schedule from the candidate courses. "
-            "Keep the total at or under 15 credits, prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
+            "Keep the total as close to 15 credits as possible without going over, unless fewer than 4 valid courses exist. "
+            "Prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
             "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
+            "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
             "You MUST include every course in required_current_course_ids in selected_course_ids. "
-            "Only use other courses to fill remaining room after all required_current_course_ids are included."
+            "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load."
         ),
         user_payload=prompt,
     )
@@ -1466,6 +1483,25 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             continue
         kept_rows.append(row)
         running_credits += credits
+
+    kept_df = pd.DataFrame(kept_rows)
+    if kept_df.empty:
+        return kept_df, result.get("rationales", [])
+
+    selected_course_ids = set(kept_df["Course ID"].tolist())
+    if running_credits < 12:
+        for _, row in pending_df.iterrows():
+            course_id = str(row["Course ID"])
+            credits = float(row["Credits"])
+            if course_id in selected_course_ids:
+                continue
+            if running_credits + credits > 15:
+                continue
+            kept_rows.append(row)
+            selected_course_ids.add(course_id)
+            running_credits += credits
+            if running_credits >= 12:
+                break
 
     return pd.DataFrame(kept_rows), result.get("rationales", [])
 
