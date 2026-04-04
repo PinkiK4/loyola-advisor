@@ -331,6 +331,26 @@ def build_empty_schedule(overlap: dict | None = None) -> pd.DataFrame:
     return empty_df
 
 
+def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
+    if schedule_df.empty:
+        return pd.DataFrame()
+
+    output_df = schedule_df[
+        [
+            "Recommended Term",
+            "Requirement Area",
+            "Requirement Block",
+            "Course ID",
+            "Course Name",
+            "Credits",
+            "Audit Status",
+        ]
+    ].reset_index(drop=True)
+    output_df.attrs["catalog_overlap_count"] = schedule_df.attrs.get("catalog_overlap_count", 0)
+    output_df.attrs["catalog_usable"] = schedule_df.attrs.get("catalog_usable", False)
+    return output_df
+
+
 def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
     if pending_df.empty:
         return pending_df
@@ -381,17 +401,7 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     if selected_df.empty:
         return pd.DataFrame()
 
-    return selected_df[
-        [
-            "Recommended Term",
-            "Requirement Area",
-            "Requirement Block",
-            "Course ID",
-            "Course Name",
-            "Credits",
-            "Audit Status",
-        ]
-    ].reset_index(drop=True)
+    return selected_df.reset_index(drop=True)
 
 
 def get_gemini_api_key() -> str:
@@ -1509,7 +1519,8 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     if pending_df.empty:
         return pd.DataFrame(), ai_notes
 
-    return pending_df.reset_index(drop=True), ai_notes
+    finalized_df = finalize_schedule_output(pending_df.reset_index(drop=True))
+    return finalized_df, ai_notes
 
 
 def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
