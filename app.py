@@ -323,6 +323,14 @@ def build_schedule_summary(schedule_df: pd.DataFrame, ai_enabled: bool) -> str:
     return f"{intro}: " + ", ".join(course_bits) + "."
 
 
+def build_empty_schedule(overlap: dict | None = None) -> pd.DataFrame:
+    empty_df = pd.DataFrame()
+    overlap = overlap or {"overlap_count": 0, "usable": False}
+    empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
+    empty_df.attrs["catalog_usable"] = overlap["usable"]
+    return empty_df
+
+
 def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
     if pending_df.empty:
         return pending_df
@@ -344,6 +352,7 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     for _, row in pending_df.iterrows():
         credits = float(row["Credits"])
         block_label = str(row.get("Requirement Block", ""))
+        recommended_term = str(row.get("Recommended Term", ""))
         block_limit = row.get("Block Remaining", 1)
         try:
             block_limit = int(block_limit) if pd.notna(block_limit) else 1
@@ -351,7 +360,7 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
             block_limit = 1
         block_limit = max(block_limit, 1)
 
-        if block_counts.get(block_label, 0) >= block_limit:
+        if recommended_term != "Current Term" and block_counts.get(block_label, 0) >= block_limit:
             continue
         if running_credits + credits > 15:
             continue
@@ -875,6 +884,33 @@ def row_matches_block_subject(row: pd.Series) -> bool:
     return subject in allowed_subjects
 
 
+def lock_language_blocks_to_transcript_subject(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
+    if pending_df.empty:
+        return pending_df
+
+    preferred_language = infer_language_subject(transcript_data)
+    if not preferred_language:
+        return pending_df
+
+    locked_groups = []
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
+        block_label = str(requirement_block or "").lower()
+        is_language_block = "language" in block_label and (
+            "104" in block_label or "intermediate ii" in block_label or "200 level" in block_label
+        )
+        if not is_language_block:
+            locked_groups.append(group)
+            continue
+
+        preferred_rows = group[group["Course ID"].str.startswith(f"{preferred_language} ", na=False)].copy()
+        if not preferred_rows.empty:
+            locked_groups.append(preferred_rows)
+        else:
+            locked_groups.append(group)
+
+    return pd.concat(locked_groups, ignore_index=True) if locked_groups else pending_df
+
+
 def drop_block_alternatives_covered_by_in_progress(
     pending_df: pd.DataFrame, requirements_df: pd.DataFrame, transcript_data: dict
 ) -> pd.DataFrame:
@@ -905,7 +941,10 @@ def drop_block_alternatives_covered_by_in_progress(
         return pending_df
 
     return pending_df[
-        ~pending_df["Requirement Block"].isin(covered_blocks)
+        ~(
+            pending_df["Requirement Block"].isin(covered_blocks)
+            & (pending_df["Audit Status"] == "Not Started")
+        )
     ].copy()
 
 
@@ -1339,15 +1378,13 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
+    pending_df = lock_language_blocks_to_transcript_subject(pending_df, transcript_data)
     pending_df = drop_block_alternatives_covered_by_in_progress(pending_df, requirements_df, transcript_data)
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
 
     overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
     if pending_df.empty:
-        empty_df = pd.DataFrame()
-        empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
-        empty_df.attrs["catalog_usable"] = overlap["usable"]
-        return empty_df, []
+        return build_empty_schedule(overlap), []
 
     if overlap["usable"]:
         pending_df = pending_df.merge(catalog_df, on="Course ID", how="left")
@@ -1399,10 +1436,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         )
     ].copy()
     if pending_df.empty:
-        empty_df = pd.DataFrame()
-        empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
-        empty_df.attrs["catalog_usable"] = overlap["usable"]
-        return empty_df, []
+        return build_empty_schedule(overlap), []
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df["Sequence Priority"] = pending_df["Course ID"].apply(
         lambda code: sequence_gap_priority(code, transcript_data)
