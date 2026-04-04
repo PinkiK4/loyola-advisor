@@ -133,7 +133,7 @@ def clean_course_title(title: str) -> str:
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b$", "", cleaned)
+    cleaned = re.sub(r"(?:\s|^)(A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)$", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.rstrip(" -,:;")
 
@@ -1720,6 +1720,8 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     if pending_df.empty:
         return pd.DataFrame(), ai_notes
 
+    pending_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
+    pending_df.attrs["catalog_usable"] = overlap["usable"]
     finalized_df = finalize_schedule_output(pending_df.reset_index(drop=True))
     return finalized_df, ai_notes
 
