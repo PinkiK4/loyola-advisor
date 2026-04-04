@@ -852,9 +852,11 @@ def parse_audit(text: str) -> dict:
         re.I,
     )
 
-    for raw_line in lines:
-        line = raw_line.strip()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
         if not line:
+            idx += 1
             continue
 
         if (
@@ -865,6 +867,7 @@ def parse_audit(text: str) -> dict:
             and len(line.split()) <= 6
         ):
             current_section = normalize_space(line)
+            idx += 1
             continue
 
         if line.startswith("Take ") or re.match(r"^\d+\.\s+(Take|Complete) ", line):
@@ -894,6 +897,7 @@ def parse_audit(text: str) -> dict:
                     }
                 )
                 language_placeholder_added = True
+            idx += 1
             continue
 
         progress_match = block_progress_pattern.search(line)
@@ -903,24 +907,56 @@ def parse_audit(text: str) -> dict:
             current_block_complete = completed >= total
             current_block_remaining = max(total - completed, 0)
             current_block_total = total
+            idx += 1
             continue
 
         if re.search(r"Fulfi\s*lled$", line, re.I) and "Status Course Grade Term Credits" not in line:
             current_block_complete = True
             current_block = normalize_space(line)
+            idx += 1
             continue
 
         if line == "Not Started":
             current_block_complete = False
+            idx += 1
             continue
 
         match = course_line_pattern.match(line)
         if not match:
+            idx += 1
             continue
 
         status, subject, number, title = match.groups()
+        continuation_parts = []
+        lookahead = idx + 1
+        while lookahead < len(lines):
+            next_line = lines[lookahead].strip()
+            if not next_line:
+                lookahead += 1
+                continue
+            if (
+                section_pattern.match(next_line)
+                or "Status Course Grade Term Credits" in next_line
+                or next_line.startswith("Take ")
+                or re.match(r"^\d+\.\s+(Take|Complete) ", next_line)
+                or next_line == "Not Started"
+                or any(next_line.startswith(prefix) for prefix in STATUS_WORDS)
+                or course_line_pattern.match(next_line)
+                or block_progress_pattern.search(next_line)
+                or next_line.startswith("https://")
+                or next_line.startswith("Page ")
+            ):
+                break
+            continuation_parts.append(next_line)
+            lookahead += 1
+
+        if continuation_parts:
+            title = normalize_space(f"{title or ''} {' '.join(continuation_parts)}")
+            idx = lookahead - 1
+
         cleaned_title = clean_course_title(title or "")
         if cleaned_title in GRADE_TOKENS:
+            idx += 1
             continue
         code = normalize_course_code(subject, number)
         canonical_status = canonicalize_audit_status(status)
@@ -943,6 +979,7 @@ def parse_audit(text: str) -> dict:
                 "Is Elective Block": is_elective_block,
             }
         )
+        idx += 1
 
     requirements_df = pd.DataFrame(requirement_rows)
     if requirements_df.empty:
@@ -1885,7 +1922,7 @@ if audit_file and transcript_file and catalog_files:
 
     with right_col:
         st.subheader("Parsing Check")
-        st.metric("Transcript GPA", transcript_gpa)
+        st.metric("Transcript GPA", gpa_display)
         st.metric("Audit GPA", audit_gpa)
         st.metric("Transcript Courses Found", len(transcript_data["courses_df"]))
         st.metric("Remaining Audit Courses", 0 if completion_state["is_complete"] else len(schedule_df))
