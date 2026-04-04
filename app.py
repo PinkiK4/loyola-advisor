@@ -311,6 +311,95 @@ def clean_catalog_title(title: str) -> str:
     return clean_course_title(title)
 
 
+TITLE_STOPWORDS = {
+    "and",
+    "for",
+    "the",
+    "of",
+    "in",
+    "to",
+    "or",
+    "ii",
+    "iii",
+    "iv",
+    "i",
+    "course",
+}
+
+
+def normalized_title_tokens(text: str) -> set[str]:
+    cleaned = clean_course_title(text).lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    tokens = {
+        token
+        for token in cleaned.split()
+        if len(token) > 1 and token not in TITLE_STOPWORDS and not token.isdigit()
+    }
+    return tokens
+
+
+def title_similarity(left: str, right: str) -> float:
+    left_tokens = normalized_title_tokens(left)
+    right_tokens = normalized_title_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+
+    overlap = len(left_tokens & right_tokens)
+    if overlap == 0:
+        return 0.0
+
+    containment = overlap / min(len(left_tokens), len(right_tokens))
+    jaccard = overlap / len(left_tokens | right_tokens)
+    return max(containment, (containment + jaccard) / 2)
+
+
+def transcript_has_equivalent_course(course_id: str, course_name: str, transcript_data: dict, min_similarity: float = 0.74) -> bool:
+    if course_id in transcript_data["taken_codes"] or course_id in transcript_data["in_progress_codes"]:
+        return True
+
+    courses_df = transcript_data.get("courses_df", pd.DataFrame())
+    if courses_df.empty or not course_name:
+        return False
+
+    for transcript_title in courses_df["Course Name"].dropna().tolist():
+        if title_similarity(course_name, str(transcript_title)) >= min_similarity:
+            return True
+    return False
+
+
+def future_audit_course_ready(row: pd.Series, transcript_data: dict) -> bool:
+    if not bool(row.get("Future Audit Snapshot", False)):
+        return True
+
+    course_id = str(row.get("Course ID", ""))
+    course_name = str(row.get("Course Name", ""))
+    match = re.match(r"^([A-Z]{2,5})\s+(\d{3})$", course_id)
+    if not match:
+        return True
+
+    subject, number = match.groups()
+    target_number = int(number)
+    if target_number < 200:
+        return True
+
+    if transcript_has_equivalent_course(course_id, course_name, transcript_data):
+        return True
+
+    subject_rows = transcript_data["courses_df"][
+        transcript_data["courses_df"]["Course ID"].str.startswith(f"{subject} ", na=False)
+    ]
+    subject_numbers = []
+    for transcript_code in subject_rows["Course ID"].tolist():
+        code_match = re.match(rf"^{re.escape(subject)}\s+(\d{{3}})$", str(transcript_code))
+        if code_match:
+            subject_numbers.append(int(code_match.group(1)))
+
+    if any(number < target_number for number in subject_numbers):
+        return True
+
+    return False
+
+
 def build_schedule_summary(schedule_df: pd.DataFrame, ai_enabled: bool) -> str:
     if schedule_df.empty:
         return ""
@@ -1479,6 +1568,10 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         ),
         axis=1,
     )
+    pending_df["Readiness Priority"] = pending_df.apply(
+        lambda row: 0 if future_audit_course_ready(row, transcript_data) else 1,
+        axis=1,
+    )
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
     pending_df = pending_df[
         ~pending_df["Course ID"].isin(
@@ -1497,6 +1590,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Priority",
             "Snapshot Priority",
             "Requirement Priority",
+            "Readiness Priority",
             "Sequence Priority",
             "Term Sort",
             "Block Priority",
@@ -1506,7 +1600,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
