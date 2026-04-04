@@ -490,8 +490,10 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     selected_rows = []
     running_credits = 0.0
     block_counts = {}
+    selected_course_ids = set()
     for _, row in pending_df.iterrows():
         credits = float(row["Credits"])
+        course_id = str(row.get("Course ID", ""))
         block_label = str(row.get("Requirement Block", ""))
         recommended_term = str(row.get("Recommended Term", ""))
         block_limit = row.get("Block Remaining", 1)
@@ -501,12 +503,15 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
             block_limit = 1
         block_limit = max(block_limit, 1)
 
+        if course_id in selected_course_ids:
+            continue
         if recommended_term != "Current Term" and block_counts.get(block_label, 0) >= block_limit:
             continue
         if running_credits + credits > 15:
             continue
         selected_rows.append(row)
         running_credits += credits
+        selected_course_ids.add(course_id)
         block_counts[block_label] = block_counts.get(block_label, 0) + 1
         if running_credits >= 15:
             break
@@ -1494,6 +1499,11 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                 and term_index(row["Audit Term"]) is not None
                 and row["Course ID"] not in transcript_data["taken_codes"]
                 and row["Course ID"] not in transcript_data["in_progress_codes"]
+                and not transcript_has_equivalent_course(
+                    str(row.get("Course ID", "")),
+                    str(row.get("Course Name", "")),
+                    transcript_data,
+                )
                 and row["Audit Term"][-2:] != "OC"
                 and term_index(row["Audit Term"]) > latest_transcript_index
             ),
@@ -1507,11 +1517,13 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     incomplete_mask = (pending_df["Requirement Complete"] != True) | future_term_mask
     pending_df = pending_df[incomplete_mask & pending_mask].copy()
     pending_df["Future Audit Snapshot"] = future_term_mask.reindex(pending_df.index, fill_value=False)
+    pending_df.loc[pending_df["Future Audit Snapshot"] == True, "Audit Status"] = "Not Started"
+    pending_df.loc[pending_df["Future Audit Snapshot"] == True, "Requirement Complete"] = False
     pending_df = pending_df[
         ~pending_df["Audit Status"].astype(str).str.contains(r"Completed|Fulfi\s*lled|Fulfilled", case=False, na=False)
         | pending_df["Course ID"].isin(["LANG 104"])
+        | (pending_df["Future Audit Snapshot"] == True)
     ].copy()
-    pending_df.loc[pending_df["Future Audit Snapshot"] == True, "Audit Status"] = "Not Started"
     pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
