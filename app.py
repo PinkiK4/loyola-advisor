@@ -140,6 +140,7 @@ def clean_course_title(title: str) -> str:
         cleaned,
     )
     cleaned = re.sub(r"\b\d{2}/[A-Z]{2}\b\s+\d+\b", "", cleaned)
+    cleaned = re.sub(r"(?<=\s)(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)(?=\s+[A-Z])", "", cleaned)
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
@@ -574,6 +575,73 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     return selected_df.reset_index(drop=True)
 
 
+def extend_schedule_to_credit_target(
+    selected_df: pd.DataFrame,
+    source_df: pd.DataFrame,
+    min_credits: float = 12.0,
+    max_credits: float = 15.0,
+) -> pd.DataFrame:
+    if selected_df.empty:
+        return selected_df
+
+    running_credits = float(selected_df["Credits"].sum())
+    if running_credits >= min_credits:
+        return selected_df.reset_index(drop=True)
+
+    selected_course_ids = set(selected_df["Course ID"].tolist())
+    block_counts = selected_df.groupby("Requirement Block").size().to_dict()
+    extra_rows = []
+
+    candidate_df = source_df.copy()
+    candidate_df["Elective Fill Priority"] = candidate_df["Is Elective Block"].map({False: 0, True: 1}).fillna(1)
+    candidate_df = candidate_df.sort_values(
+        by=[
+            "Elective Fill Priority",
+            "Priority",
+            "Snapshot Priority",
+            "Requirement Priority",
+            "Readiness Priority",
+            "Sequence Priority",
+            "Term Sort",
+            "Level",
+            "Course ID",
+        ],
+        ascending=[True, True, True, True, True, True, True, True, True],
+    )
+
+    for _, row in candidate_df.iterrows():
+        if running_credits >= min_credits:
+            break
+
+        course_id = str(row.get("Course ID", ""))
+        block_label = str(row.get("Requirement Block", ""))
+        if course_id in selected_course_ids:
+            continue
+
+        credits = float(row["Credits"])
+        if running_credits + credits > max_credits:
+            continue
+
+        block_limit = row.get("Block Remaining", 1)
+        try:
+            block_limit = int(block_limit) if pd.notna(block_limit) else 1
+        except Exception:
+            block_limit = 1
+        block_limit = max(block_limit, 1)
+        if block_counts.get(block_label, 0) >= block_limit:
+            continue
+
+        extra_rows.append(row)
+        selected_course_ids.add(course_id)
+        block_counts[block_label] = block_counts.get(block_label, 0) + 1
+        running_credits += credits
+
+    if not extra_rows:
+        return selected_df.reset_index(drop=True)
+
+    return pd.concat([selected_df, pd.DataFrame(extra_rows)], ignore_index=True).reset_index(drop=True)
+
+
 def get_gemini_api_key() -> str:
     session_key = st.session_state.get("gemini_api_key_input", "").strip()
     if session_key:
@@ -652,6 +720,24 @@ def should_merge_pdf_line(previous_line: str, current_line: str) -> bool:
         return False
 
     return True
+
+
+def is_likely_title_continuation(line: str) -> bool:
+    cleaned = normalize_space(line)
+    if not cleaned:
+        return False
+    if any(token in cleaned for token in ("http://", "https://", "Page ", "Status Course Grade Term Credits")):
+        return False
+    if re.match(r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\b", cleaned, re.I):
+        return False
+    if re.match(r"^\d+\.\s+(Take|Complete)\b", cleaned, re.I):
+        return False
+    if re.match(r"^[A-Z]{2,4}\*?\d{3}\b", cleaned):
+        return False
+    if re.search(r"\b\d{2}/[A-Z]{2}\b|\b\d+\.\d+\b", cleaned):
+        return False
+    words = cleaned.split()
+    return len(words) <= 4 and all(re.match(r"^[A-Za-z&'\-]+$", word) for word in words)
 
 
 def soften_pdf_line_breaks(text: str) -> str:
@@ -945,8 +1031,7 @@ def parse_audit(text: str) -> dict:
                 lookahead += 1
                 continue
             if (
-                section_pattern.match(next_line)
-                or "Status Course Grade Term Credits" in next_line
+                "Status Course Grade Term Credits" in next_line
                 or next_line.startswith("Take ")
                 or re.match(r"^\d+\.\s+(Take|Complete) ", next_line)
                 or next_line == "Not Started"
@@ -955,6 +1040,7 @@ def parse_audit(text: str) -> dict:
                 or block_progress_pattern.search(next_line)
                 or next_line.startswith("https://")
                 or next_line.startswith("Page ")
+                or (section_pattern.match(next_line) and not is_likely_title_continuation(next_line))
             ):
                 break
             continuation_parts.append(next_line)
@@ -1157,6 +1243,8 @@ def drop_block_alternatives_covered_by_in_progress(
         if remaining_needed <= 0:
             continue
 
+        # Only trust transcript-confirmed in-progress courses here. A newer audit can mark
+        # future courses as in progress even when an older transcript has not reached them yet.
         in_progress_count = int(group["Course ID"].isin(in_progress_codes).sum())
         if in_progress_count >= remaining_needed:
             covered_blocks.add(requirement_block)
@@ -1168,6 +1256,7 @@ def drop_block_alternatives_covered_by_in_progress(
         ~(
             pending_df["Requirement Block"].isin(covered_blocks)
             & (pending_df["Audit Status"] == "Not Started")
+            & (pending_df.get("Future Audit Snapshot", False) != True)
         )
     ].copy()
 
@@ -1529,7 +1618,8 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
             "You MUST include every course in required_current_course_ids in selected_course_ids. "
-            "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load."
+            "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load. "
+            "When the student is on a Data Science path and required courses are already represented, prefer adding a reasonable remaining major elective before stopping at 12 credits."
         ),
         user_payload=prompt,
     )
@@ -1564,22 +1654,8 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
     if kept_df.empty:
         return kept_df, result.get("rationales", [])
 
-    selected_course_ids = set(kept_df["Course ID"].tolist())
-    if running_credits < 12:
-        for _, row in pending_df.iterrows():
-            course_id = str(row["Course ID"])
-            credits = float(row["Credits"])
-            if course_id in selected_course_ids:
-                continue
-            if running_credits + credits > 15:
-                continue
-            kept_rows.append(row)
-            selected_course_ids.add(course_id)
-            running_credits += credits
-            if running_credits >= 12:
-                break
-
-    return pd.DataFrame(kept_rows), result.get("rationales", [])
+    kept_df = extend_schedule_to_credit_target(kept_df, pending_df, min_credits=12.0, max_credits=15.0)
+    return kept_df, result.get("rationales", [])
 
 
 def ai_schedule_is_valid(candidate_df: pd.DataFrame, optimized_df: pd.DataFrame) -> bool:
@@ -1728,6 +1804,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
+    ranked_schedule_df = extend_schedule_to_credit_target(ranked_schedule_df, pending_df, min_credits=12.0, max_credits=15.0)
     ranked_schedule_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
     ranked_schedule_df.attrs["catalog_usable"] = overlap["usable"]
     ai_notes = []
