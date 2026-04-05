@@ -1170,6 +1170,15 @@ def parse_audit(text: str) -> dict:
     return {"requirements_df": requirements_df, "audit_gpa": audit_gpa}
 
 
+def extract_course_codes(text: str) -> list[str]:
+    codes = []
+    for subject, number in re.findall(r"\b([A-Z]{2,4})\*?\s?(\d{3})\b", text or ""):
+        code = normalize_course_code(subject, number)
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
 def parse_catalogs(catalog_files) -> pd.DataFrame:
     entries = OrderedDict()
     course_pattern = re.compile(
@@ -1179,8 +1188,24 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
 
     for catalog_file in catalog_files:
         text = uploaded_pdf_text(catalog_file)
+        current_year = ""
+        current_term = ""
+        curriculum_rank = 0
         for raw_line in text.splitlines():
             line = normalize_space(raw_line)
+            if not line:
+                continue
+
+            year_match = re.match(r"^(Freshman|Sophomore|Junior|Senior)\s+Year$", line, re.I)
+            if year_match:
+                current_year = year_match.group(1).title()
+                continue
+
+            term_match = re.match(r"^(Fall|Spring|Summer|Winter)\s+Term$", line, re.I)
+            if term_match:
+                current_term = term_match.group(1).title()
+                continue
+
             match = course_pattern.search(line)
             if not match:
                 continue
@@ -1188,13 +1213,88 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
             subject, number, title = match.groups()
             code = normalize_course_code(subject, number)
             credits_match = credit_pattern.search(line)
-            entries[code] = {
-                "Course ID": code,
-                "Catalog Title": clean_catalog_title(title),
-                "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
-            }
+            prereq_codes = []
+            prereq_match = re.search(r"Prerequisite[s]?:\s*(.+)$", line, re.I)
+            if prereq_match:
+                prereq_codes = extract_course_codes(prereq_match.group(1))
+            if code not in entries:
+                curriculum_rank += 1
+                entries[code] = {
+                    "Course ID": code,
+                    "Catalog Title": clean_catalog_title(title),
+                    "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
+                    "Catalog Terms": [],
+                    "Catalog Prereqs": [],
+                    "Catalog Rank": curriculum_rank if current_year or current_term else None,
+                }
+            if current_term and current_term not in entries[code]["Catalog Terms"]:
+                entries[code]["Catalog Terms"].append(current_term)
+            for prereq_code in prereq_codes:
+                if prereq_code not in entries[code]["Catalog Prereqs"]:
+                    entries[code]["Catalog Prereqs"].append(prereq_code)
 
-    return pd.DataFrame(entries.values()) if entries else pd.DataFrame()
+    if not entries:
+        return pd.DataFrame()
+
+    catalog_rows = []
+    for value in entries.values():
+        catalog_rows.append(
+            {
+                "Course ID": value["Course ID"],
+                "Catalog Title": value["Catalog Title"],
+                "Catalog Credits": value["Catalog Credits"],
+                "Catalog Terms": ", ".join(value["Catalog Terms"]),
+                "Catalog Prereqs": ", ".join(value["Catalog Prereqs"]),
+                "Catalog Rank": value["CatalogRank"] if "CatalogRank" in value else value["Catalog Rank"],
+            }
+        )
+    return pd.DataFrame(catalog_rows)
+
+
+def recommended_term_name(term_label: str) -> str:
+    term_text = str(term_label or "")
+    if term_text in {"Current Term", "Next Term"}:
+        return ""
+    if term_text.endswith("/SP"):
+        return "Spring"
+    if term_text.endswith("/FA"):
+        return "Fall"
+    if term_text.endswith("/SU"):
+        return "Summer"
+    if term_text.endswith("/WI"):
+        return "Winter"
+    return ""
+
+
+def catalog_term_available(recommended_term: str, catalog_terms: str) -> bool:
+    terms = [normalize_space(part) for part in str(catalog_terms or "").split(",") if normalize_space(part)]
+    if not terms:
+        return True
+    expected_term = recommended_term_name(recommended_term)
+    if not expected_term:
+        return True
+    return expected_term in terms
+
+
+def catalog_prereqs_satisfied(course_id: str, catalog_prereqs: str, transcript_data: dict, pending_df: pd.DataFrame) -> bool:
+    prereq_codes = [normalize_space(part) for part in str(catalog_prereqs or "").split(",") if normalize_space(part)]
+    if not prereq_codes:
+        return True
+
+    satisfied_codes = set(transcript_data["taken_codes"]) | set(transcript_data["in_progress_codes"])
+    candidate_codes = set(pending_df["Course ID"].tolist()) if not pending_df.empty else set()
+    current_course_level_match = re.search(r"(\d{3})", str(course_id))
+    current_course_level = int(current_course_level_match.group(1)) if current_course_level_match else 999
+
+    for prereq_code in prereq_codes:
+        if prereq_code in satisfied_codes:
+            continue
+        prereq_level_match = re.search(r"(\d{3})", prereq_code)
+        prereq_level = int(prereq_level_match.group(1)) if prereq_level_match else 0
+        if prereq_code in candidate_codes and prereq_level < current_course_level:
+            return False
+        return False
+    return True
 
 
 def catalog_overlap_summary(catalog_df: pd.DataFrame, transcript_data: dict, audit_data: dict) -> dict:
@@ -1819,6 +1919,9 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         pending_df["Credits"] = pending_df["Catalog Credits"].fillna(3.0)
     else:
         pending_df["Credits"] = 3.0
+        pending_df["Catalog Terms"] = ""
+        pending_df["Catalog Prereqs"] = ""
+        pending_df["Catalog Rank"] = pd.NA
 
     pending_df["Audit Term Index"] = pending_df["Audit Term"].apply(term_index)
     pending_df["Level"] = pending_df["Course ID"].str.extract(r"(\d{3})").astype(float)
@@ -1858,10 +1961,25 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         ),
         axis=1,
     )
+    pending_df["Catalog Term Priority"] = pending_df.apply(
+        lambda row: 0 if catalog_term_available(row["Recommended Term"], row.get("Catalog Terms", "")) else 1,
+        axis=1,
+    )
+    pending_df["Catalog Prereq Ready"] = pending_df.apply(
+        lambda row: catalog_prereqs_satisfied(
+            row["Course ID"],
+            row.get("Catalog Prereqs", ""),
+            transcript_data,
+            pending_df,
+        ),
+        axis=1,
+    )
+    pending_df["Catalog Prereq Priority"] = pending_df["Catalog Prereq Ready"].map({True: 0, False: 1}).fillna(0)
     pending_df["Readiness Priority"] = pending_df.apply(
         lambda row: 0 if future_audit_course_ready(row, transcript_data) else 1,
         axis=1,
     )
+    pending_df["Catalog Rank"] = pd.to_numeric(pending_df["Catalog Rank"], errors="coerce").fillna(999)
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
     pending_df = pending_df[
         ~pending_df["Course ID"].isin(
@@ -1880,17 +1998,20 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Priority",
             "Snapshot Priority",
             "Requirement Priority",
+            "Catalog Prereq Priority",
             "Readiness Priority",
             "Sequence Priority",
             "Term Sort",
+            "Catalog Term Priority",
             "Block Priority",
             "Block Remaining",
             "Block Order",
             "Recommended Term",
+            "Catalog Rank",
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
