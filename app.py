@@ -1296,6 +1296,73 @@ def infer_catalog_plan_rank(year_label: str, term_label: str, position: int) -> 
     )
 
 
+def level_based_catalog_rank(course_id: str) -> int | None:
+    match = re.search(r"(\d{3})", str(course_id))
+    if not match:
+        return None
+
+    number = int(match.group(1))
+    if number >= 400:
+        return 350
+    if number >= 300:
+        return 250
+    if number >= 200:
+        return 150
+    if number >= 100:
+        return 50
+    return None
+
+
+def apply_catalog_fallback_metadata(entries: OrderedDict) -> None:
+    populated_entries = [
+        value
+        for value in entries.values()
+        if value["Catalog Terms"] or value["Catalog Rank"] is not None
+    ]
+
+    for value in entries.values():
+        if value["Catalog Terms"] and value["Catalog Rank"] is not None:
+            continue
+
+        title = str(value.get("Catalog Title", ""))
+        best_match = None
+        best_score = 0.0
+        for reference in populated_entries:
+            if reference["Course ID"] == value["Course ID"]:
+                continue
+            score = title_similarity(title, str(reference.get("Catalog Title", "")))
+            if score > best_score:
+                best_score = score
+                best_match = reference
+
+        if best_match and best_score >= 0.9:
+            if not value["Catalog Terms"] and best_match["Catalog Terms"]:
+                value["Catalog Terms"] = list(best_match["Catalog Terms"])
+            if value["Catalog Rank"] is None and best_match["Catalog Rank"] is not None:
+                value["Catalog Rank"] = best_match["Catalog Rank"]
+
+        offering_notes = " | ".join(value.get("Catalog Offering Notes", []))
+        title_lower = title.lower()
+
+        if not value["Catalog Terms"]:
+            if re.search(r"\bfall only\b", offering_notes, re.I):
+                value["Catalog Terms"] = ["Fall"]
+            elif re.search(r"\bspring only\b", offering_notes, re.I):
+                value["Catalog Terms"] = ["Spring"]
+            elif re.search(r"\bsummer only\b", offering_notes, re.I):
+                value["Catalog Terms"] = ["Summer"]
+            elif "capstone" in title_lower:
+                value["Catalog Terms"] = ["Spring"]
+            else:
+                value["Catalog Terms"] = ["Fall", "Spring"]
+
+        if value["Catalog Rank"] is None:
+            if "capstone" in title_lower:
+                value["Catalog Rank"] = 380
+            else:
+                value["Catalog Rank"] = level_based_catalog_rank(value["Course ID"])
+
+
 def parse_catalog_notes(text: str) -> dict:
     notes_by_course: dict[str, dict[str, list[str]]] = {}
 
@@ -1478,6 +1545,8 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
 
     if not entries:
         return pd.DataFrame()
+
+    apply_catalog_fallback_metadata(entries)
 
     catalog_rows = []
     for value in entries.values():
