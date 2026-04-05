@@ -909,23 +909,60 @@ def parse_transcript(text: str) -> dict:
     }
 
 
-def derive_program_major(audit_text: str, catalog_files, transcript_major: str) -> str:
-    majors_match = re.search(r"^Majors:\s*(.+)$", audit_text, re.I | re.M)
-    specializations_match = re.search(r"^Specializations:\s*(.+)$", audit_text, re.I | re.M)
-    if majors_match and specializations_match:
-        return f"{normalize_space(majors_match.group(1))}, {normalize_space(specializations_match.group(1))}"
-    if majors_match:
-        return normalize_space(majors_match.group(1))
+def parse_program_profile(audit_text: str, catalog_files, transcript_major: str) -> dict:
+    def extract_items(label: str) -> list[str]:
+        match = re.search(rf"^{label}:\s*(.+)$", audit_text, re.I | re.M)
+        if not match:
+            return []
+        raw_value = normalize_space(match.group(1))
+        if not raw_value:
+            return []
+        parts = re.split(r"\s*(?:,| and )\s*", raw_value)
+        return [normalize_space(part) for part in parts if normalize_space(part)]
 
+    majors = extract_items("Majors")
+    specializations = extract_items("Specializations")
+    minors = extract_items("Minors")
+
+    catalog_programs = []
     for catalog_file in catalog_files or []:
         catalog_text = uploaded_pdf_text(catalog_file)
         program_match = re.search(r"^Program:\s*(.+)$", catalog_text, re.I | re.M)
-        if program_match:
-            program_name = normalize_space(program_match.group(1))
-            program_name = re.sub(r"\s*-\s*Loyola University Maryland.*$", "", program_name, flags=re.I)
-            return program_name
+        if not program_match:
+            continue
+        program_name = normalize_space(program_match.group(1))
+        program_name = re.sub(r"\s*-\s*Loyola University Maryland.*$", "", program_name, flags=re.I)
+        if program_name and program_name not in catalog_programs:
+            catalog_programs.append(program_name)
 
-    return transcript_major if transcript_major and transcript_major != "Unknown" else "Unknown"
+    if not majors and transcript_major and transcript_major != "Unknown":
+        majors = [transcript_major]
+
+    display_parts = []
+    if majors:
+        display_parts.append(", ".join(majors))
+    if specializations:
+        display_parts.append(", ".join(specializations))
+    if minors:
+        minor_label = ", ".join(minors)
+        if len(minors) == 1:
+            display_parts.append(f"Minor: {minor_label}")
+        else:
+            display_parts.append(f"Minors: {minor_label}")
+    if not display_parts and catalog_programs:
+        display_parts.extend(catalog_programs[:2])
+
+    return {
+        "majors": majors,
+        "specializations": specializations,
+        "minors": minors,
+        "catalog_programs": catalog_programs,
+        "display_label": " | ".join(display_parts) if display_parts else "Unknown",
+    }
+
+
+def derive_program_major(audit_text: str, catalog_files, transcript_major: str) -> str:
+    return parse_program_profile(audit_text, catalog_files, transcript_major)["display_label"]
 
 
 def build_completion_state(transcript_data: dict, audit_data: dict, display_major: str, schedule_df: pd.DataFrame | None = None) -> dict:
@@ -1641,6 +1678,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
     prompt = {
         "student": {
             "major": transcript_data["major"],
+            "program_profile": transcript_data.get("program_profile", {}),
             "earned_credits": transcript_data["total"],
             "gpa": transcript_data["qpa"],
             "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
@@ -1661,6 +1699,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "Keep the total as close to 15 credits as possible without going over, unless fewer than 4 valid courses exist. "
             "Prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
             "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
+            "If the student has multiple majors, specializations, or minors, preserve a balanced forward path across those programs without double-counting overlapping courses. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
             "You MUST include every course in required_current_course_ids in selected_course_ids. "
             "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load. "
@@ -2002,8 +2041,10 @@ if audit_file and transcript_file and catalog_files:
     transcript_data = parse_transcript(transcript_text)
     audit_data = parse_audit(audit_text)
     catalog_df = parse_catalogs(catalog_files or [])
-    display_major = derive_program_major(audit_text, catalog_files or [], transcript_data["major"])
+    program_profile = parse_program_profile(audit_text, catalog_files or [], transcript_data["major"])
+    display_major = program_profile["display_label"]
     transcript_data["major"] = display_major
+    transcript_data["program_profile"] = program_profile
     schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
     completion_state = build_completion_state(transcript_data, audit_data, display_major, schedule_df)
 
