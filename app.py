@@ -152,6 +152,12 @@ def clean_course_title(title: str) -> str:
 def strip_catalog_title_noise(title: str) -> str:
     cleaned = clean_course_title(title)
     cleaned = re.sub(
+        r"\b(Freshman|Sophomore|Junior|Senior)\s+Year\b.*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
         r"\b(?:Spring|Fall|Summer|Winter)\s+Term\b",
         "",
         cleaned,
@@ -163,6 +169,7 @@ def strip_catalog_title_noise(title: str) -> str:
         cleaned,
         flags=re.I,
     )
+    cleaned = re.sub(r"\bElective\b", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\bRestricted to [^.]+\.?", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\bAppropriate course as approved by [^.]+\.?", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\bor\s*$", "", cleaned, flags=re.I)
@@ -1201,6 +1208,29 @@ def extract_course_codes(text: str) -> list[str]:
     return codes
 
 
+def split_embedded_catalog_markers(line: str) -> list[str]:
+    expanded = line
+    expanded = re.sub(
+        r"\s+((?:Freshman|Sophomore|Junior|Senior)\s+Year)\b",
+        r"\n\1\n",
+        expanded,
+        flags=re.I,
+    )
+    expanded = re.sub(
+        r"\s+((?:Fall|Spring|Summer|Winter)\s+Term)\b",
+        r"\n\1\n",
+        expanded,
+        flags=re.I,
+    )
+    expanded = re.sub(
+        r"\s+(Program:\s+)",
+        r"\n\1",
+        expanded,
+        flags=re.I,
+    )
+    return [normalize_space(part) for part in expanded.splitlines() if normalize_space(part)]
+
+
 def split_catalog_course_blocks(text: str) -> list[dict]:
     course_header_pattern = re.compile(r"^\s*([A-Z]{2,4})\s+(\d{3})\s*[-:]\s*(.+)$")
     blocks = []
@@ -1209,36 +1239,33 @@ def split_catalog_course_blocks(text: str) -> list[dict]:
     current_term = ""
 
     for raw_line in text.splitlines():
-        line = normalize_space(raw_line)
-        if not line:
-            continue
+        for line in split_embedded_catalog_markers(raw_line):
+            year_match = re.match(r"^(Freshman|Sophomore|Junior|Senior)\s+Year$", line, re.I)
+            if year_match:
+                current_year = year_match.group(1).title()
+                continue
 
-        year_match = re.match(r"^(Freshman|Sophomore|Junior|Senior)\s+Year$", line, re.I)
-        if year_match:
-            current_year = year_match.group(1).title()
-            continue
+            term_match = re.match(r"^(Fall|Spring|Summer|Winter)\s+Term$", line, re.I)
+            if term_match:
+                current_term = term_match.group(1).title()
+                continue
 
-        term_match = re.match(r"^(Fall|Spring|Summer|Winter)\s+Term$", line, re.I)
-        if term_match:
-            current_term = term_match.group(1).title()
-            continue
+            header_match = course_header_pattern.match(line)
+            if header_match:
+                subject, number, title = header_match.groups()
+                if current_block:
+                    blocks.append(current_block)
+                current_block = {
+                    "course_id": normalize_course_code(subject, number),
+                    "title_line": title,
+                    "lines": [line],
+                    "year": current_year,
+                    "term": current_term,
+                }
+                continue
 
-        header_match = course_header_pattern.match(line)
-        if header_match:
-            subject, number, title = header_match.groups()
             if current_block:
-                blocks.append(current_block)
-            current_block = {
-                "course_id": normalize_course_code(subject, number),
-                "title_line": title,
-                "lines": [line],
-                "year": current_year,
-                "term": current_term,
-            }
-            continue
-
-        if current_block:
-            current_block["lines"].append(line)
+                current_block["lines"].append(line)
 
     if current_block:
         blocks.append(current_block)
