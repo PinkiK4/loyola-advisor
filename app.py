@@ -128,8 +128,18 @@ def canonicalize_audit_status(text: str) -> str:
 
 def clean_course_title(title: str) -> str:
     cleaned = normalize_space(title)
-    cleaned = re.sub(r"\b(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b\s+\d{2}/[A-Z]{2}\s+\d+(?:\.\d+)?\b", "", cleaned)
+    cleaned = re.sub(
+        r"\b(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b\s+\d{2}/[A-Z]{2}\s+\d+(?:\.\d+)?\b",
+        "",
+        cleaned,
+    )
     cleaned = re.sub(r"\b\d{2}/[A-Z]{2}\b\s+\d+(?:\.\d+)?\b", "", cleaned)
+    cleaned = re.sub(
+        r"\b(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)\b\s+\d{2}/[A-Z]{2}\s+\d+\b",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(r"\b\d{2}/[A-Z]{2}\b\s+\d+\b", "", cleaned)
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
