@@ -2011,7 +2011,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
