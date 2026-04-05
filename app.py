@@ -1667,7 +1667,13 @@ def ai_schedule_is_valid(candidate_df: pd.DataFrame, optimized_df: pd.DataFrame)
     )
     optimized_ids = set(optimized_df["Course ID"].tolist())
     candidate_ids = set(candidate_df["Course ID"].tolist())
-    return required_current_ids.issubset(optimized_ids) and optimized_ids.issubset(candidate_ids)
+    credit_total = float(optimized_df["Credits"].sum()) if "Credits" in optimized_df.columns else 0.0
+    has_reasonable_load = credit_total >= 9 or len(candidate_df) <= 2
+    return (
+        required_current_ids.issubset(optimized_ids)
+        and optimized_ids.issubset(candidate_ids)
+        and has_reasonable_load
+    )
 
 
 def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame, use_ai: bool = False):
@@ -1815,7 +1821,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                 ai_candidate_df = select_ai_candidate_window(ranked_schedule_df)
                 optimized_df, schedule_notes = optimize_schedule_with_ai(ai_candidate_df, transcript_data)
                 if ai_schedule_is_valid(ai_candidate_df, optimized_df):
-                    pending_df = optimized_df
+                    pending_df = extend_schedule_to_credit_target(
+                        optimized_df,
+                        ranked_schedule_df,
+                        min_credits=12.0,
+                        max_credits=15.0,
+                    )
                     ai_notes.extend(schedule_notes)
                 else:
                     ai_notes.append(
