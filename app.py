@@ -424,6 +424,51 @@ def build_schedule_summary(schedule_df: pd.DataFrame, ai_enabled: bool) -> str:
     return f"{intro}: " + ", ".join(course_bits) + "."
 
 
+def default_course_reason(row: pd.Series) -> str:
+    course_id = str(row.get("Course ID", ""))
+    course_name = str(row.get("Course Name", ""))
+    block = str(row.get("Requirement Block", ""))
+    area = str(row.get("Requirement Area", ""))
+    recommended_term = str(row.get("Recommended Term", ""))
+    is_elective = bool(row.get("Is Elective Block", False))
+
+    if recommended_term == "Current Term":
+        return f"{course_id} is already on the active path for the current term and remains part of the strongest requirement sequence."
+    if "DS 496" == course_id:
+        return f"{course_id} is the required Data Science capstone and should stay in the graduation plan."
+    if is_elective:
+        return f"{course_id} helps fill a remaining elective requirement from the current degree path after higher-priority required courses."
+    if "Foreign Language" in block or "language" in block.lower():
+        return f"{course_id} continues the remaining language/core requirement for the selected degree path."
+    if "Data Science" in area or "CS*151, DS*496, IS*358, MA*251, ST*472" in block:
+        return f"{course_id} is still needed in the remaining Data Science requirement path."
+    return f"{course_id} remains one of the strongest unfinished requirements in the current degree path."
+
+
+def ensure_reason_coverage(schedule_df: pd.DataFrame, notes: list[dict]) -> list[dict]:
+    if schedule_df.empty:
+        return notes
+
+    covered_ids = {
+        str(item.get("course_id", "")).strip()
+        for item in notes
+        if isinstance(item, dict) and item.get("course_id")
+    }
+    augmented = list(notes)
+    for _, row in schedule_df.iterrows():
+        course_id = str(row.get("Course ID", "")).strip()
+        if not course_id or course_id in covered_ids:
+            continue
+        augmented.append(
+            {
+                "course_id": course_id,
+                "reason": default_course_reason(row),
+            }
+        )
+        covered_ids.add(course_id)
+    return augmented
+
+
 def build_empty_schedule(overlap: dict | None = None) -> pd.DataFrame:
     empty_df = pd.DataFrame()
     overlap = overlap or {"overlap_count": 0, "usable": False}
@@ -1827,7 +1872,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                         min_credits=12.0,
                         max_credits=15.0,
                     )
-                    ai_notes.extend(schedule_notes)
+                    ai_notes.extend(ensure_reason_coverage(pending_df, schedule_notes))
                 else:
                     ai_notes.append(
                         {"reason": "AI fallback used deterministic ranking because the AI plan dropped required current-term courses."}
