@@ -149,6 +149,28 @@ def clean_course_title(title: str) -> str:
     return cleaned.rstrip(" -,:;")
 
 
+def strip_catalog_title_noise(title: str) -> str:
+    cleaned = clean_course_title(title)
+    cleaned = re.sub(
+        r"\b(?:Spring|Fall|Summer|Winter)\s+Term\b",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"\b(?:Language Core|Social Science Core|Fine Arts Core|HS-\d{3}\s+Level Core Course|Core Elective|Elective Component|Foundational Component)\b",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\bRestricted to [^.]+\.?", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bAppropriate course as approved by [^.]+\.?", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bor\s*$", "", cleaned, flags=re.I)
+    cleaned = cleaned.replace("*", " ")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned.rstrip(" -,:;")
+
+
 def parse_audit_term_code(text: str) -> str:
     match = re.search(r"\b(\d{2}/[A-Z]{2})\b", text)
     return match.group(1) if match else ""
@@ -1224,6 +1246,29 @@ def split_catalog_course_blocks(text: str) -> list[dict]:
     return blocks
 
 
+def infer_catalog_plan_rank(year_label: str, term_label: str, position: int) -> int | None:
+    if not year_label and not term_label:
+        return None
+
+    year_map = {
+        "Freshman": 0,
+        "Sophomore": 1,
+        "Junior": 2,
+        "Senior": 3,
+    }
+    term_map = {
+        "Fall": 0,
+        "Winter": 1,
+        "Spring": 2,
+        "Summer": 3,
+    }
+    return (
+        year_map.get(year_label, 9) * 100
+        + term_map.get(term_label, 9) * 10
+        + position
+    )
+
+
 def parse_catalog_notes(text: str) -> dict:
     notes_by_course: dict[str, dict[str, list[str]]] = {}
 
@@ -1340,11 +1385,10 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
     for catalog_file in catalog_files:
         text = uploaded_pdf_text(catalog_file)
         notes_by_course = parse_catalog_notes(text)
-        curriculum_rank = 0
-        for block in split_catalog_course_blocks(text):
+        blocks = split_catalog_course_blocks(text)
+        for position, block in enumerate(blocks, start=1):
             code = block["course_id"]
-            line = normalize_space(block["lines"][0])
-            title = block["title_line"]
+            title = strip_catalog_title_noise(block["title_line"])
             block_text = "\n".join(block["lines"])
             credits_match = credit_pattern.search(block_text)
             interpreted = interpret_catalog_rule_text(block_text)
@@ -1352,11 +1396,11 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
             prereq_match = re.search(r"Prerequisite[s]?:\s*(.+)$", block_text, re.I)
             if prereq_match:
                 prereq_codes = extract_course_codes(prereq_match.group(1))
+            block_rank = infer_catalog_plan_rank(block["year"], block["term"], position)
             if code not in entries:
-                curriculum_rank += 1
                 entries[code] = {
                     "Course ID": code,
-                    "Catalog Title": clean_catalog_title(title),
+                    "Catalog Title": title,
                     "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
                     "Catalog Terms": [],
                     "Catalog Prereqs": [],
@@ -1364,8 +1408,10 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                     "Catalog Restrictions": [],
                     "Catalog Offering Notes": [],
                     "Catalog Rule Text": "",
-                    "Catalog Rank": curriculum_rank if block["year"] or block["term"] else None,
+                    "Catalog Rank": block_rank,
                 }
+            elif entries[code]["Catalog Rank"] is None and block_rank is not None:
+                entries[code]["Catalog Rank"] = block_rank
             if block["term"] and block["term"] not in entries[code]["Catalog Terms"]:
                 entries[code]["Catalog Terms"].append(block["term"])
             for prereq_code in prereq_codes:
