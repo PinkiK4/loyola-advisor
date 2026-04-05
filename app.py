@@ -1179,6 +1179,86 @@ def extract_course_codes(text: str) -> list[str]:
     return codes
 
 
+def parse_catalog_notes(text: str) -> dict:
+    notes_by_course: dict[str, dict[str, list[str]]] = {}
+
+    def ensure_course_entry(course_id: str) -> dict[str, list[str]]:
+        if course_id not in notes_by_course:
+            notes_by_course[course_id] = {
+                "prereqs": [],
+                "coreqs": [],
+                "offering_notes": [],
+                "restrictions": [],
+            }
+        return notes_by_course[course_id]
+
+    normalized_text = normalize_space(text)
+    sentences = re.split(r"(?<=[.])\s+", normalized_text)
+    for sentence in sentences:
+        if not sentence:
+            continue
+
+        prereq_match = re.search(
+            r"([A-Z]{2,4}\s?\d{3})\s+is a prerequisite for\s+([A-Z]{2,4}\s?\d{3})",
+            sentence,
+            re.I,
+        )
+        if prereq_match:
+            prereq_code = normalize_course_code(*re.match(r"([A-Z]{2,4})\s?(\d{3})", prereq_match.group(1), re.I).groups())
+            target_code = normalize_course_code(*re.match(r"([A-Z]{2,4})\s?(\d{3})", prereq_match.group(2), re.I).groups())
+            entry = ensure_course_entry(target_code)
+            if prereq_code not in entry["prereqs"]:
+                entry["prereqs"].append(prereq_code)
+
+        coreq_match = re.search(
+            r"([A-Z]{2,4}\s?\d{3})\s+is a co(?:-|\s)?requisite for\s+([A-Z]{2,4}\s?\d{3})",
+            sentence,
+            re.I,
+        )
+        if coreq_match:
+            coreq_code = normalize_course_code(*re.match(r"([A-Z]{2,4})\s?(\d{3})", coreq_match.group(1), re.I).groups())
+            target_code = normalize_course_code(*re.match(r"([A-Z]{2,4})\s?(\d{3})", coreq_match.group(2), re.I).groups())
+            entry = ensure_course_entry(target_code)
+            if coreq_code not in entry["coreqs"]:
+                entry["coreqs"].append(coreq_code)
+
+        offering_match = re.search(r"((?:[A-Z]{2,4}\s?\d{3}(?:\s+and\s+)?)+)\s+are offered every other year", sentence, re.I)
+        if offering_match:
+            for course_code in extract_course_codes(offering_match.group(1)):
+                entry = ensure_course_entry(course_code)
+                note = "Offered every other year"
+                if note not in entry["offering_notes"]:
+                    entry["offering_notes"].append(note)
+
+        standing_match = re.search(
+            r"([A-Z]{2,4}\s?\d{3})[^.]*\b(junior|senior)\s+standing\b",
+            sentence,
+            re.I,
+        )
+        if standing_match:
+            course_code = normalize_course_code(*re.match(r"([A-Z]{2,4})\s?(\d{3})", standing_match.group(1), re.I).groups())
+            entry = ensure_course_entry(course_code)
+            restriction = f"{standing_match.group(2).title()} standing"
+            if restriction not in entry["restrictions"]:
+                entry["restrictions"].append(restriction)
+
+        if "cannot be combined with a minor in" in sentence.lower():
+            restricted_programs = re.split(
+                r",|\s+or\s+",
+                re.sub(r".*cannot be combined with a minor in", "", sentence, flags=re.I),
+            )
+            restricted_programs = [normalize_space(item.strip(" .")) for item in restricted_programs if normalize_space(item.strip(" ."))]
+            for course_code in extract_course_codes(text):
+                if course_code.startswith(("DS ", "IS ", "ST ", "CS ", "MA ", "EC ")):
+                    entry = ensure_course_entry(course_code)
+                    for program in restricted_programs:
+                        restriction = f"Minor restriction: {program}"
+                        if restriction not in entry["restrictions"]:
+                            entry["restrictions"].append(restriction)
+
+    return notes_by_course
+
+
 def parse_catalogs(catalog_files) -> pd.DataFrame:
     entries = OrderedDict()
     course_pattern = re.compile(
@@ -1188,6 +1268,7 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
 
     for catalog_file in catalog_files:
         text = uploaded_pdf_text(catalog_file)
+        notes_by_course = parse_catalog_notes(text)
         current_year = ""
         current_term = ""
         curriculum_rank = 0
@@ -1225,6 +1306,9 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                     "Catalog Credits": float(credits_match.group(1)) if credits_match else 3.0,
                     "Catalog Terms": [],
                     "Catalog Prereqs": [],
+                    "Catalog Coreqs": [],
+                    "Catalog Restrictions": [],
+                    "Catalog Offering Notes": [],
                     "Catalog Rank": curriculum_rank if current_year or current_term else None,
                 }
             if current_term and current_term not in entries[code]["Catalog Terms"]:
@@ -1232,6 +1316,19 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
             for prereq_code in prereq_codes:
                 if prereq_code not in entries[code]["Catalog Prereqs"]:
                     entries[code]["Catalog Prereqs"].append(prereq_code)
+            note_entry = notes_by_course.get(code, {})
+            for prereq_code in note_entry.get("prereqs", []):
+                if prereq_code not in entries[code]["Catalog Prereqs"]:
+                    entries[code]["Catalog Prereqs"].append(prereq_code)
+            for coreq_code in note_entry.get("coreqs", []):
+                if coreq_code not in entries[code]["Catalog Coreqs"]:
+                    entries[code]["Catalog Coreqs"].append(coreq_code)
+            for restriction in note_entry.get("restrictions", []):
+                if restriction not in entries[code]["Catalog Restrictions"]:
+                    entries[code]["Catalog Restrictions"].append(restriction)
+            for offering_note in note_entry.get("offering_notes", []):
+                if offering_note not in entries[code]["Catalog Offering Notes"]:
+                    entries[code]["Catalog Offering Notes"].append(offering_note)
 
     if not entries:
         return pd.DataFrame()
@@ -1245,6 +1342,9 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                 "Catalog Credits": value["Catalog Credits"],
                 "Catalog Terms": ", ".join(value["Catalog Terms"]),
                 "Catalog Prereqs": ", ".join(value["Catalog Prereqs"]),
+                "Catalog Coreqs": ", ".join(value["Catalog Coreqs"]),
+                "Catalog Restrictions": " | ".join(value["Catalog Restrictions"]),
+                "Catalog Offering Notes": " | ".join(value["Catalog Offering Notes"]),
                 "Catalog Rank": value["CatalogRank"] if "CatalogRank" in value else value["Catalog Rank"],
             }
         )
@@ -1295,6 +1395,46 @@ def catalog_prereqs_satisfied(course_id: str, catalog_prereqs: str, transcript_d
             return False
         return False
     return True
+
+
+def catalog_coreqs_satisfied(catalog_coreqs: str, transcript_data: dict, pending_df: pd.DataFrame) -> bool:
+    coreq_codes = [normalize_space(part) for part in str(catalog_coreqs or "").split(",") if normalize_space(part)]
+    if not coreq_codes:
+        return True
+
+    satisfied_codes = set(transcript_data["taken_codes"]) | set(transcript_data["in_progress_codes"])
+    candidate_codes = set(pending_df["Course ID"].tolist()) if not pending_df.empty else set()
+    return all(code in satisfied_codes or code in candidate_codes for code in coreq_codes)
+
+
+def catalog_restrictions_satisfied(restrictions: str, transcript_data: dict) -> bool:
+    restriction_items = [normalize_space(part) for part in re.split(r"\|", str(restrictions or "")) if normalize_space(part)]
+    if not restriction_items:
+        return True
+
+    earned_credits = float(transcript_data.get("total") or 0)
+    program_profile = transcript_data.get("program_profile", {})
+    minors = [item.lower() for item in program_profile.get("minors", [])]
+
+    for restriction in restriction_items:
+        lowered = restriction.lower()
+        if "junior standing" in lowered and earned_credits < 60:
+            return False
+        if "senior standing" in lowered and earned_credits < 90:
+            return False
+        if lowered.startswith("minor restriction:"):
+            restricted_minor = lowered.replace("minor restriction:", "", 1).strip()
+            if any(restricted_minor in minor for minor in minors):
+                return False
+    return True
+
+
+def catalog_offering_priority(recommended_term: str, offering_notes: str, catalog_terms: str) -> int:
+    if not catalog_term_available(recommended_term, catalog_terms):
+        return 1
+    if "every other year" in str(offering_notes or "").lower():
+        return 1
+    return 0
 
 
 def catalog_overlap_summary(catalog_df: pd.DataFrame, transcript_data: dict, audit_data: dict) -> dict:
@@ -1768,6 +1908,11 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "Requirement Area",
             "Recommended Term",
             "Audit Status",
+            "Catalog Prereqs",
+            "Catalog Coreqs",
+            "Catalog Restrictions",
+            "Catalog Offering Notes",
+            "Catalog Terms",
         ]
     ].copy()
     candidates["Requirement Block"] = pending_df.apply(sanitized_requirement_block_label, axis=1)
@@ -1801,6 +1946,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
             "If the student has multiple majors, specializations, or minors, preserve a balanced forward path across those programs without double-counting overlapping courses. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
+            "Respect catalog prerequisite, co-requisite, restriction, and offering-note hints whenever they are present. "
             "You MUST include every course in required_current_course_ids in selected_course_ids. "
             "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load. "
             "When the student is on a Data Science path and required courses are already represented, prefer adding a reasonable remaining major elective before stopping at 12 credits."
@@ -1921,6 +2067,9 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         pending_df["Credits"] = 3.0
         pending_df["Catalog Terms"] = ""
         pending_df["Catalog Prereqs"] = ""
+        pending_df["Catalog Coreqs"] = ""
+        pending_df["Catalog Restrictions"] = ""
+        pending_df["Catalog Offering Notes"] = ""
         pending_df["Catalog Rank"] = pd.NA
 
     pending_df["Audit Term Index"] = pending_df["Audit Term"].apply(term_index)
@@ -1975,6 +2124,22 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         axis=1,
     )
     pending_df["Catalog Prereq Priority"] = pending_df["Catalog Prereq Ready"].map({True: 0, False: 1}).fillna(0)
+    pending_df["Catalog Coreq Priority"] = pending_df.apply(
+        lambda row: 0 if catalog_coreqs_satisfied(row.get("Catalog Coreqs", ""), transcript_data, pending_df) else 1,
+        axis=1,
+    )
+    pending_df["Catalog Restriction Priority"] = pending_df.apply(
+        lambda row: 0 if catalog_restrictions_satisfied(row.get("Catalog Restrictions", ""), transcript_data) else 1,
+        axis=1,
+    )
+    pending_df["Catalog Offering Priority"] = pending_df.apply(
+        lambda row: catalog_offering_priority(
+            row["Recommended Term"],
+            row.get("Catalog Offering Notes", ""),
+            row.get("Catalog Terms", ""),
+        ),
+        axis=1,
+    )
     pending_df["Readiness Priority"] = pending_df.apply(
         lambda row: 0 if future_audit_course_ready(row, transcript_data) else 1,
         axis=1,
@@ -1999,10 +2164,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Snapshot Priority",
             "Requirement Priority",
             "Catalog Prereq Priority",
+            "Catalog Coreq Priority",
+            "Catalog Restriction Priority",
             "Readiness Priority",
             "Sequence Priority",
             "Term Sort",
-            "Catalog Term Priority",
+            "Catalog Offering Priority",
             "Block Priority",
             "Block Remaining",
             "Block Order",
@@ -2011,7 +2178,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
