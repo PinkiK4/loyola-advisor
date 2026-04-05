@@ -1179,6 +1179,51 @@ def extract_course_codes(text: str) -> list[str]:
     return codes
 
 
+def split_catalog_course_blocks(text: str) -> list[dict]:
+    course_header_pattern = re.compile(r"^\s*([A-Z]{2,4})\s+(\d{3})\s*[-:]\s*(.+)$")
+    blocks = []
+    current_block = None
+    current_year = ""
+    current_term = ""
+
+    for raw_line in text.splitlines():
+        line = normalize_space(raw_line)
+        if not line:
+            continue
+
+        year_match = re.match(r"^(Freshman|Sophomore|Junior|Senior)\s+Year$", line, re.I)
+        if year_match:
+            current_year = year_match.group(1).title()
+            continue
+
+        term_match = re.match(r"^(Fall|Spring|Summer|Winter)\s+Term$", line, re.I)
+        if term_match:
+            current_term = term_match.group(1).title()
+            continue
+
+        header_match = course_header_pattern.match(line)
+        if header_match:
+            subject, number, title = header_match.groups()
+            if current_block:
+                blocks.append(current_block)
+            current_block = {
+                "course_id": normalize_course_code(subject, number),
+                "title_line": title,
+                "lines": [line],
+                "year": current_year,
+                "term": current_term,
+            }
+            continue
+
+        if current_block:
+            current_block["lines"].append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    return blocks
+
+
 def parse_catalog_notes(text: str) -> dict:
     notes_by_course: dict[str, dict[str, list[str]]] = {}
 
@@ -1259,43 +1304,60 @@ def parse_catalog_notes(text: str) -> dict:
     return notes_by_course
 
 
+def interpret_catalog_rule_text(block_text: str) -> dict:
+    normalized = normalize_space(block_text)
+    prereqs = extract_course_codes(re.sub(r".*?(?:Prerequisite[s]?|Prereq[s]?):", "", normalized, flags=re.I))
+    coreqs = extract_course_codes(re.sub(r".*?(?:Corequisite[s]?|Coreq[s]?):", "", normalized, flags=re.I))
+    restrictions = []
+    offering_notes = []
+    standing_requirements = []
+
+    if re.search(r"\bjunior standing\b", normalized, re.I):
+        restrictions.append("Junior standing")
+        standing_requirements.append("Junior standing")
+    if re.search(r"\bsenior standing\b", normalized, re.I):
+        restrictions.append("Senior standing")
+        standing_requirements.append("Senior standing")
+    if re.search(r"\bpermission of instructor\b|\bpermission of program director\b", normalized, re.I):
+        restrictions.append("Permission required")
+    if re.search(r"\bevery other year\b|\balternate years?\b", normalized, re.I):
+        offering_notes.append("Offered every other year")
+    if re.search(r"\bfall only\b", normalized, re.I):
+        offering_notes.append("Fall only")
+    if re.search(r"\bspring only\b", normalized, re.I):
+        offering_notes.append("Spring only")
+    if re.search(r"\bsummer only\b", normalized, re.I):
+        offering_notes.append("Summer only")
+    if re.search(r"\bor equivalent\b", normalized, re.I):
+        restrictions.append("Equivalent course allowed")
+
+    return {
+        "prereqs": prereqs,
+        "coreqs": coreqs,
+        "restrictions": restrictions,
+        "offering_notes": offering_notes,
+        "standing_requirements": standing_requirements,
+        "raw_rule_text": normalized,
+    }
+
+
 def parse_catalogs(catalog_files) -> pd.DataFrame:
     entries = OrderedDict()
-    course_pattern = re.compile(
-        r"\b([A-Z]{2,4})\s+(\d{3})\s*[-:]\s*([A-Za-z0-9&,'/().\- ]+?)(?=\s{2,}|Prerequisite|Corequisite|$)"
-    )
     credit_pattern = re.compile(r"(\d+(?:\.\d+)?)\s+credits?", re.I)
 
     for catalog_file in catalog_files:
         text = uploaded_pdf_text(catalog_file)
         notes_by_course = parse_catalog_notes(text)
-        current_year = ""
-        current_term = ""
         curriculum_rank = 0
-        for raw_line in text.splitlines():
-            line = normalize_space(raw_line)
-            if not line:
-                continue
-
-            year_match = re.match(r"^(Freshman|Sophomore|Junior|Senior)\s+Year$", line, re.I)
-            if year_match:
-                current_year = year_match.group(1).title()
-                continue
-
-            term_match = re.match(r"^(Fall|Spring|Summer|Winter)\s+Term$", line, re.I)
-            if term_match:
-                current_term = term_match.group(1).title()
-                continue
-
-            match = course_pattern.search(line)
-            if not match:
-                continue
-
-            subject, number, title = match.groups()
-            code = normalize_course_code(subject, number)
-            credits_match = credit_pattern.search(line)
+        for block in split_catalog_course_blocks(text):
+            code = block["course_id"]
+            line = normalize_space(block["lines"][0])
+            title = block["title_line"]
+            block_text = "\n".join(block["lines"])
+            credits_match = credit_pattern.search(block_text)
+            interpreted = interpret_catalog_rule_text(block_text)
             prereq_codes = []
-            prereq_match = re.search(r"Prerequisite[s]?:\s*(.+)$", line, re.I)
+            prereq_match = re.search(r"Prerequisite[s]?:\s*(.+)$", block_text, re.I)
             if prereq_match:
                 prereq_codes = extract_course_codes(prereq_match.group(1))
             if code not in entries:
@@ -1309,10 +1371,11 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                     "Catalog Coreqs": [],
                     "Catalog Restrictions": [],
                     "Catalog Offering Notes": [],
-                    "Catalog Rank": curriculum_rank if current_year or current_term else None,
+                    "Catalog Rule Text": "",
+                    "Catalog Rank": curriculum_rank if block["year"] or block["term"] else None,
                 }
-            if current_term and current_term not in entries[code]["Catalog Terms"]:
-                entries[code]["Catalog Terms"].append(current_term)
+            if block["term"] and block["term"] not in entries[code]["Catalog Terms"]:
+                entries[code]["Catalog Terms"].append(block["term"])
             for prereq_code in prereq_codes:
                 if prereq_code not in entries[code]["Catalog Prereqs"]:
                     entries[code]["Catalog Prereqs"].append(prereq_code)
@@ -1329,6 +1392,20 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
             for offering_note in note_entry.get("offering_notes", []):
                 if offering_note not in entries[code]["Catalog Offering Notes"]:
                     entries[code]["Catalog Offering Notes"].append(offering_note)
+            for prereq_code in interpreted.get("prereqs", []):
+                if prereq_code not in entries[code]["Catalog Prereqs"]:
+                    entries[code]["Catalog Prereqs"].append(prereq_code)
+            for coreq_code in interpreted.get("coreqs", []):
+                if coreq_code not in entries[code]["Catalog Coreqs"]:
+                    entries[code]["Catalog Coreqs"].append(coreq_code)
+            for restriction in interpreted.get("restrictions", []):
+                if restriction not in entries[code]["Catalog Restrictions"]:
+                    entries[code]["Catalog Restrictions"].append(restriction)
+            for offering_note in interpreted.get("offering_notes", []):
+                if offering_note not in entries[code]["Catalog Offering Notes"]:
+                    entries[code]["Catalog Offering Notes"].append(offering_note)
+            if interpreted.get("raw_rule_text"):
+                entries[code]["Catalog Rule Text"] = interpreted["raw_rule_text"]
 
     if not entries:
         return pd.DataFrame()
@@ -1345,6 +1422,7 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                 "Catalog Coreqs": ", ".join(value["Catalog Coreqs"]),
                 "Catalog Restrictions": " | ".join(value["Catalog Restrictions"]),
                 "Catalog Offering Notes": " | ".join(value["Catalog Offering Notes"]),
+                "Catalog Rule Text": value["Catalog Rule Text"],
                 "Catalog Rank": value["CatalogRank"] if "CatalogRank" in value else value["Catalog Rank"],
             }
         )
@@ -1435,6 +1513,88 @@ def catalog_offering_priority(recommended_term: str, offering_notes: str, catalo
     if "every other year" in str(offering_notes or "").lower():
         return 1
     return 0
+
+
+def estimate_program_overlap_priority(row: pd.Series, program_profile: dict) -> int:
+    majors = [item.lower() for item in program_profile.get("majors", [])]
+    minors = [item.lower() for item in program_profile.get("minors", [])]
+    specializations = [item.lower() for item in program_profile.get("specializations", [])]
+    haystack = " ".join(
+        [
+            str(row.get("Requirement Area", "")),
+            str(row.get("Requirement Block", "")),
+            str(row.get("Course Name", "")),
+        ]
+    ).lower()
+
+    match_count = 0
+    for group in (majors, minors, specializations):
+        for item in group:
+            item_tokens = [token for token in re.split(r"[\s,/&-]+", item) if len(token) > 2]
+            if item_tokens and any(token in haystack for token in item_tokens):
+                match_count += 1
+
+    if match_count >= 2:
+        return 0
+    if match_count == 1:
+        return 1
+    return 2
+
+
+def planning_bucket(recommended_term: str) -> int:
+    term_text = str(recommended_term or "")
+    if term_text == "Current Term":
+        return 0
+    if term_text in {"Next Term", "26/SP", "26/FA", "26/SU", "26/WI"}:
+        return 1
+    return 2
+
+
+def build_local_reference_context(base_dir: str, transcript_data: dict, audit_data: dict) -> list[dict]:
+    references = []
+    if not base_dir or not os.path.isdir(base_dir):
+        return references
+
+    relevant_codes = set(transcript_data.get("taken_codes", set()))
+    if not audit_data["requirements_df"].empty:
+        relevant_codes |= set(audit_data["requirements_df"]["Course ID"].tolist())
+
+    for filename in sorted(os.listdir(base_dir)):
+        lower_name = filename.lower()
+        if not lower_name.endswith(".pdf"):
+            continue
+        if "audit" not in lower_name:
+            continue
+
+        path = os.path.join(base_dir, filename)
+        try:
+            class _Upload:
+                def __init__(self, p):
+                    self.p = p
+
+                def getbuffer(self):
+                    return open(self.p, "rb").read()
+
+            ref_text = uploaded_pdf_text(_Upload(path))
+            ref_audit = parse_audit(ref_text)["requirements_df"]
+            if ref_audit.empty:
+                continue
+            ref_codes = set(ref_audit["Course ID"].tolist())
+            overlap_count = len(ref_codes & relevant_codes)
+            if overlap_count == 0:
+                continue
+            references.append(
+                {
+                    "file": filename,
+                    "overlap_count": overlap_count,
+                    "sample_courses": sorted(list(ref_codes & relevant_codes))[:8],
+                }
+            )
+        except Exception:
+            continue
+
+    references.sort(key=lambda item: item["overlap_count"], reverse=True)
+    return references[:5]
 
 
 def catalog_overlap_summary(catalog_df: pd.DataFrame, transcript_data: dict, audit_data: dict) -> dict:
@@ -1924,6 +2084,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         "student": {
             "major": transcript_data["major"],
             "program_profile": transcript_data.get("program_profile", {}),
+            "reference_context": transcript_data.get("reference_context", []),
             "earned_credits": transcript_data["total"],
             "gpa": transcript_data["qpa"],
             "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
@@ -1947,6 +2108,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "If the student has multiple majors, specializations, or minors, preserve a balanced forward path across those programs without double-counting overlapping courses. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
             "Respect catalog prerequisite, co-requisite, restriction, and offering-note hints whenever they are present. "
+            "Use the reference_context only as a weak pattern guide for similar stored audits; never let it override the uploaded audit, transcript, or catalog rules. "
             "You MUST include every course in required_current_course_ids in selected_course_ids. "
             "After including required_current_course_ids, keep filling the schedule with the strongest remaining candidates until it reaches a realistic full load. "
             "When the student is on a Data Science path and required courses are already represented, prefer adding a reasonable remaining major elective before stopping at 12 credits."
@@ -2144,6 +2306,11 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         lambda row: 0 if future_audit_course_ready(row, transcript_data) else 1,
         axis=1,
     )
+    pending_df["Program Overlap Priority"] = pending_df.apply(
+        lambda row: estimate_program_overlap_priority(row, transcript_data.get("program_profile", {})),
+        axis=1,
+    )
+    pending_df["Planning Bucket"] = pending_df["Recommended Term"].apply(planning_bucket)
     pending_df["Catalog Rank"] = pd.to_numeric(pending_df["Catalog Rank"], errors="coerce").fillna(999)
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
     pending_df = pending_df[
@@ -2166,7 +2333,9 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Catalog Prereq Priority",
             "Catalog Coreq Priority",
             "Catalog Restriction Priority",
+            "Program Overlap Priority",
             "Readiness Priority",
+            "Planning Bucket",
             "Sequence Priority",
             "Term Sort",
             "Catalog Offering Priority",
@@ -2178,7 +2347,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             "Level",
             "Course ID",
         ],
-        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True],
+        ascending=[True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True],
     )
 
     ranked_schedule_df = select_ranked_schedule(pending_df)
@@ -2333,6 +2502,11 @@ if audit_file and transcript_file and catalog_files:
     display_major = program_profile["display_label"]
     transcript_data["major"] = display_major
     transcript_data["program_profile"] = program_profile
+    transcript_data["reference_context"] = build_local_reference_context(
+        os.path.dirname(os.path.abspath(__file__)),
+        transcript_data,
+        audit_data,
+    )
     schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
     completion_state = build_completion_state(transcript_data, audit_data, display_major, schedule_df)
 
@@ -2420,6 +2594,33 @@ if audit_file and transcript_file and catalog_files:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        with st.expander("Catalog Rule Debug"):
+            if not catalog_df.empty:
+                debug_columns = [
+                    "Course ID",
+                    "Catalog Title",
+                    "Catalog Terms",
+                    "Catalog Prereqs",
+                    "Catalog Coreqs",
+                    "Catalog Restrictions",
+                    "Catalog Offering Notes",
+                    "Catalog Rank",
+                ]
+                present_columns = [column for column in debug_columns if column in catalog_df.columns]
+                st.dataframe(
+                    catalog_df[present_columns].head(40),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.write("No parsed catalog rules available.")
+
+        with st.expander("Reference Audits"):
+            if transcript_data.get("reference_context"):
+                st.dataframe(pd.DataFrame(transcript_data["reference_context"]), use_container_width=True, hide_index=True)
+            else:
+                st.write("No similar stored audit references found.")
 
         if ai_notes:
             with st.expander("AI Decisions"):
