@@ -1287,27 +1287,19 @@ def parse_catalog_notes(text: str) -> dict:
             if restriction not in entry["restrictions"]:
                 entry["restrictions"].append(restriction)
 
-        if "cannot be combined with a minor in" in sentence.lower():
-            restricted_programs = re.split(
-                r",|\s+or\s+",
-                re.sub(r".*cannot be combined with a minor in", "", sentence, flags=re.I),
-            )
-            restricted_programs = [normalize_space(item.strip(" .")) for item in restricted_programs if normalize_space(item.strip(" ."))]
-            for course_code in extract_course_codes(text):
-                if course_code.startswith(("DS ", "IS ", "ST ", "CS ", "MA ", "EC ")):
-                    entry = ensure_course_entry(course_code)
-                    for program in restricted_programs:
-                        restriction = f"Minor restriction: {program}"
-                        if restriction not in entry["restrictions"]:
-                            entry["restrictions"].append(restriction)
-
     return notes_by_course
 
 
 def interpret_catalog_rule_text(block_text: str) -> dict:
     normalized = normalize_space(block_text)
-    prereqs = extract_course_codes(re.sub(r".*?(?:Prerequisite[s]?|Prereq[s]?):", "", normalized, flags=re.I))
-    coreqs = extract_course_codes(re.sub(r".*?(?:Corequisite[s]?|Coreq[s]?):", "", normalized, flags=re.I))
+    prereqs = []
+    coreqs = []
+    prereq_match = re.search(r"(?:Prerequisite[s]?|Prereq[s]?):\s*(.+)", normalized, re.I)
+    if prereq_match:
+        prereqs = extract_course_codes(prereq_match.group(1))
+    coreq_match = re.search(r"(?:Corequisite[s]?|Coreq[s]?):\s*(.+)", normalized, re.I)
+    if coreq_match:
+        coreqs = extract_course_codes(coreq_match.group(1))
     restrictions = []
     offering_notes = []
     standing_requirements = []
@@ -1393,9 +1385,13 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
                 if offering_note not in entries[code]["Catalog Offering Notes"]:
                     entries[code]["Catalog Offering Notes"].append(offering_note)
             for prereq_code in interpreted.get("prereqs", []):
+                if prereq_code == code:
+                    continue
                 if prereq_code not in entries[code]["Catalog Prereqs"]:
                     entries[code]["Catalog Prereqs"].append(prereq_code)
             for coreq_code in interpreted.get("coreqs", []):
+                if coreq_code == code:
+                    continue
                 if coreq_code not in entries[code]["Catalog Coreqs"]:
                     entries[code]["Catalog Coreqs"].append(coreq_code)
             for restriction in interpreted.get("restrictions", []):
