@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -11,6 +12,23 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 from fpdf import FPDF
+
+LOCAL_DEPS_DIR = os.path.join(os.path.dirname(__file__), ".deps")
+if os.path.isdir(LOCAL_DEPS_DIR) and LOCAL_DEPS_DIR not in sys.path:
+    sys.path.append(LOCAL_DEPS_DIR)
+SHARED_DEPS_DIR = "/Users/krishon/Documents/New project/.deps"
+if os.path.isdir(SHARED_DEPS_DIR) and SHARED_DEPS_DIR not in sys.path:
+    sys.path.append(SHARED_DEPS_DIR)
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except ImportError:
+    RapidOCR = None
+
+try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
 
 st.set_page_config(
     page_title="AI Schedule Advisor | Loyola 2026",
@@ -101,6 +119,16 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+APP_BUILD = "2026-04-08 GroupProject OCR fix"
+NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
+IN_PROGRESS_GRADES = {"CIP", "IP"}
+OCR_MIN_SCORE = 0.35
+GRADE_PATTERN = "|".join(sorted((re.escape(token) for token in GRADE_TOKENS), key=len, reverse=True))
+TERM_PATTERN = re.compile(r"\b(Fall|Spring|Summer|Winter)\s+\d{2}\b", re.I)
+TRANSCRIPT_COURSE_START_PATTERN = re.compile(r"\b([A-Z]{2,4})\s+(\d{3}[A-Z]?)\s+([A-Z0-9]{2,3})\b")
+TRANSCRIPT_SEGMENT_PATTERN = re.compile(
+    rf"^([A-Z]{{2,4}})\s+(\d{{3}}[A-Z]?)\s+([A-Z0-9]{{2,3}})\s+(.+?)\s+(\d+\.\d{{2}})(?:\s+({GRADE_PATTERN}))?(?=\s|$)"
+)
 CATALOG_DEFAULT_COLUMNS = {
     "Catalog Terms": "",
     "Catalog Prereqs": "",
@@ -117,6 +145,148 @@ def normalize_space(text: str) -> str:
 
 def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
+
+
+def extracted_text_stats(text: str) -> dict:
+    meaningful_chars = len(re.sub(r"\s+", "", text))
+    nonempty_lines = sum(1 for line in text.splitlines() if line.strip())
+    return {
+        "char_count": meaningful_chars,
+        "line_count": nonempty_lines,
+        "usable": meaningful_chars >= 40 and nonempty_lines >= 3,
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def get_ocr_engine():
+    if RapidOCR is None:
+        return None
+    try:
+        return RapidOCR()
+    except Exception:
+        return None
+
+
+def ocr_available() -> bool:
+    return pdfium is not None and get_ocr_engine() is not None
+
+
+def extract_embedded_pdf_text(pdf_path: str) -> str:
+    with pdfplumber.open(pdf_path) as pdf:
+        extracted_pages = []
+        for page in pdf.pages:
+            extracted_pages.append(page.extract_text(x_tolerance=2, y_tolerance=3) or "")
+        return soften_pdf_line_breaks("\n".join(extracted_pages))
+
+
+def ocr_lines_from_result(result) -> list[str]:
+    rows = []
+    for box, text, score in result or []:
+        if float(score) < OCR_MIN_SCORE:
+            continue
+        xs = [point[0] for point in box]
+        ys = [point[1] for point in box]
+        rows.append(
+            {
+                "text": normalize_space(text),
+                "x": min(xs),
+                "y": min(ys),
+                "height": max(ys) - min(ys),
+            }
+        )
+
+    rows.sort(key=lambda row: (row["y"], row["x"]))
+    groups = []
+    for row in rows:
+        placed = False
+        for group in groups:
+            if abs(row["y"] - group["y"]) <= max(10, row["height"] * 0.55, group["height"] * 0.55):
+                group["items"].append(row)
+                group["height"] = max(group["height"], row["height"])
+                placed = True
+                break
+        if not placed:
+            groups.append({"y": row["y"], "height": row["height"], "items": [row]})
+
+    lines = []
+    for group in groups:
+        items = sorted(group["items"], key=lambda row: row["x"])
+        line = normalize_space(" ".join(item["text"] for item in items))
+        if line:
+            lines.append(line)
+    return lines
+
+
+def ocr_pdf_text(pdf_path: str) -> str:
+    if pdfium is None:
+        return ""
+
+    ocr_engine = get_ocr_engine()
+    if ocr_engine is None:
+        return ""
+
+    document = pdfium.PdfDocument(pdf_path)
+    pages = []
+    for page_index in range(len(document)):
+        image_array = document[page_index].render(scale=2).to_numpy()
+        result, _ = ocr_engine(image_array)
+        page_lines = ocr_lines_from_result(result)
+        if page_lines:
+            pages.append("\n".join(page_lines))
+    return "\n\n".join(pages)
+
+
+def extract_pdf_content(uploaded_file) -> dict:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        temp_path = tmp.name
+
+    try:
+        embedded_text = extract_embedded_pdf_text(temp_path)
+        embedded_stats = extracted_text_stats(embedded_text)
+        if embedded_stats["usable"]:
+            return {
+                "text": embedded_text,
+                "method": "embedded",
+                "stats": embedded_stats,
+                "embedded_stats": embedded_stats,
+            }
+
+        ocr_text = ocr_pdf_text(temp_path) if ocr_available() else ""
+        ocr_stats = extracted_text_stats(ocr_text)
+        if ocr_stats["usable"]:
+            return {
+                "text": ocr_text,
+                "method": "ocr",
+                "stats": ocr_stats,
+                "embedded_stats": embedded_stats,
+            }
+
+        return {
+            "text": embedded_text or ocr_text,
+            "method": "none",
+            "stats": ocr_stats if ocr_text else embedded_stats,
+            "embedded_stats": embedded_stats,
+        }
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def latest_term_label(term_markers: list[tuple[int, str]], position: int) -> str:
+    current_term = ""
+    for marker_position, label in term_markers:
+        if marker_position > position:
+            break
+        current_term = label
+    return current_term
+
+
+def course_counts_as_completed(grade: str, credits: float) -> bool:
+    normalized_grade = str(grade or "").strip().upper()
+    if normalized_grade in NON_COMPLETION_GRADES | IN_PROGRESS_GRADES:
+        return False
+    return credits > 0
 
 
 def canonicalize_audit_status(text: str) -> str:
@@ -840,21 +1010,7 @@ def soften_pdf_line_breaks(text: str) -> str:
 
 
 def uploaded_pdf_text(uploaded_file) -> str:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        temp_path = tmp.name
-
-    try:
-        with pdfplumber.open(temp_path) as pdf:
-            extracted_pages = []
-            for page in pdf.pages:
-                extracted_pages.append(
-                    page.extract_text(x_tolerance=2, y_tolerance=3) or ""
-                )
-            return soften_pdf_line_breaks("\n".join(extracted_pages))
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
+    return extract_pdf_content(uploaded_file)["text"]
 
 
 def parse_transcript(text: str) -> dict:
@@ -867,12 +1023,7 @@ def parse_transcript(text: str) -> dict:
     gpa = "N/A"
     course_rows = []
     qpa_values = []
-    current_term = ""
-
-    term_heading_pattern = re.compile(r"^(Fall|Spring|Summer|Winter)\s+\d{2}$", re.I)
-    course_pattern = re.compile(
-        r"([A-Z]{2,4})\s+(\d{3})\s+([A-Z0-9]{2,3})\s+(.+?)\s+(\d+\.\d{2})(?:\s+([A-Z][+-]?|CIP|IP|P|S|U|W|AU))(?=(?:\s+[A-Z]{2,4}\s+\d{3}\s+[A-Z0-9]{2,3}\s)|\s+Term CA:|\s+Total CA:|$)"
-    )
+    term_markers = [(match.start(), match.group(0)) for match in TERM_PATTERN.finditer(text)]
 
     header_name_match = re.search(r"Name:\s*(.+?)\s+LOYOLA UNIVERSITY MARYLAND", text, re.I)
     if header_name_match:
@@ -907,10 +1058,13 @@ def parse_transcript(text: str) -> dict:
         if qpa_match:
             qpa_values.append(float(qpa_match.group(1)))
 
-        if term_heading_pattern.match(line):
-            current_term = line
-
-        for course_match in course_pattern.finditer(line):
+    course_start_matches = list(TRANSCRIPT_COURSE_START_PATTERN.finditer(text))
+    for index, course_start in enumerate(course_start_matches):
+        start = course_start.start()
+        end = course_start_matches[index + 1].start() if index + 1 < len(course_start_matches) else len(text)
+        segment = normalize_space(text[start:end])
+        course_match = TRANSCRIPT_SEGMENT_PATTERN.match(segment)
+        if course_match:
             subject, number, section, raw_title, credits, grade = course_match.groups()
             code = normalize_course_code(subject, number)
             course_rows.append(
@@ -920,7 +1074,7 @@ def parse_transcript(text: str) -> dict:
                     "Section": section,
                     "Credits": float(credits),
                     "Grade": grade or "",
-                    "Term": current_term,
+                    "Term": latest_term_label(term_markers, start),
                 }
             )
 
@@ -929,12 +1083,25 @@ def parse_transcript(text: str) -> dict:
         gpa = f"{nonzero_qpas[-1]:.3f}"
 
     courses_df = pd.DataFrame(course_rows)
-    taken_codes = set(courses_df["Course ID"].tolist()) if not courses_df.empty else set()
-    in_progress_codes = (
-        set(courses_df.loc[courses_df["Grade"].isin({"CIP", "IP"}), "Course ID"].tolist())
+    completed_codes = (
+        set(
+            courses_df.loc[
+                courses_df.apply(
+                    lambda row: course_counts_as_completed(row["Grade"], float(row["Credits"])),
+                    axis=1,
+                ),
+                "Course ID",
+            ].tolist()
+        )
         if not courses_df.empty
         else set()
     )
+    in_progress_codes = (
+        set(courses_df.loc[courses_df["Grade"].isin(IN_PROGRESS_GRADES), "Course ID"].tolist())
+        if not courses_df.empty
+        else set()
+    )
+    progression_codes = completed_codes | in_progress_codes
 
     return {
         "name": name,
@@ -943,7 +1110,9 @@ def parse_transcript(text: str) -> dict:
         "qpa": gpa,
         "total": total_credits,
         "courses_df": courses_df,
-        "taken_codes": taken_codes,
+        "taken_codes": completed_codes,
+        "completed_codes": completed_codes,
+        "progression_codes": progression_codes,
         "in_progress_codes": in_progress_codes,
     }
 
@@ -2575,6 +2744,7 @@ def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
 
 with st.sidebar:
     st.header("Document Center")
+    st.caption(f"Build: {APP_BUILD}")
     provider_options = ["Gemini", "Ollama"]
     provider = st.selectbox("AI provider", provider_options, index=0)
     st.session_state["ai_provider"] = provider.lower()
@@ -2629,13 +2799,18 @@ with st.sidebar:
 
 
 st.title("Loyola AI Schedule Advisor")
+st.caption(f"Build: {APP_BUILD}")
 
 if audit_file and transcript_file and catalog_files:
-    transcript_text = uploaded_pdf_text(transcript_file)
-    audit_text = uploaded_pdf_text(audit_file)
+    transcript_payload = extract_pdf_content(transcript_file)
+    audit_payload = extract_pdf_content(audit_file)
+    transcript_text = transcript_payload["text"]
+    audit_text = audit_payload["text"]
+    transcript_text_stats = transcript_payload["stats"]
+    audit_text_stats = audit_payload["stats"]
 
     transcript_data = parse_transcript(transcript_text)
-    audit_data = parse_audit(audit_text)
+    audit_data = parse_audit(audit_text) if audit_text_stats["usable"] else {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A"}
     catalog_df = parse_catalogs(catalog_files or [])
     program_profile = parse_program_profile(audit_text, catalog_files or [], transcript_data["major"])
     display_major = program_profile["display_label"]
@@ -2668,7 +2843,17 @@ if audit_file and transcript_file and catalog_files:
     left_col, right_col = st.columns([2, 1])
 
     with left_col:
-        if completion_state["is_complete"]:
+        if not transcript_text_stats["usable"]:
+            st.subheader("Recommended Schedule")
+            st.error(
+                "The transcript PDF did not produce usable text, even after fallback extraction, so the parser cannot build a reliable course history."
+            )
+        elif not audit_text_stats["usable"]:
+            st.subheader("Recommended Schedule")
+            st.error(
+                "The degree audit PDF did not yield usable text, even after fallback extraction, so remaining courses cannot be determined from it."
+            )
+        elif completion_state["is_complete"]:
             st.subheader("Graduation Status")
             st.success(completion_state["message"])
             st.markdown(
@@ -2685,6 +2870,10 @@ if audit_file and transcript_file and catalog_files:
             st.success("No remaining courses were detected from the audit.")
         else:
             st.subheader("Recommended Schedule")
+            if audit_payload["method"] == "ocr":
+                st.info("OCR fallback was used for the degree audit because its PDF text layer was not readable here.")
+            if transcript_payload["method"] == "ocr":
+                st.info("OCR fallback was used for the transcript.")
             summary_text = build_schedule_summary(schedule_df, use_ai and not bool(ai_notes and "fallback used" in str(ai_notes[0]).lower()))
             if summary_text:
                 st.info(summary_text)
@@ -2713,6 +2902,18 @@ if audit_file and transcript_file and catalog_files:
         st.metric("Remaining Audit Courses", 0 if completion_state["is_complete"] else len(schedule_df))
         st.metric("Suggested Credits", int(schedule_df["Credits"].sum()) if not schedule_df.empty else 0)
         st.metric("Catalog Matches", int(schedule_df.attrs.get("catalog_overlap_count", 0)))
+
+        with st.expander("Extraction Diagnostics"):
+            st.write(
+                {
+                    "transcript_method": transcript_payload["method"],
+                    "transcript_embedded_text_chars": transcript_payload["embedded_stats"]["char_count"],
+                    "transcript_final_text_chars": transcript_text_stats["char_count"],
+                    "audit_method": audit_payload["method"],
+                    "audit_embedded_text_chars": audit_payload["embedded_stats"]["char_count"],
+                    "audit_final_text_chars": audit_text_stats["char_count"],
+                }
+            )
 
         with st.expander("In-Progress Courses"):
             if transcript_data["in_progress_codes"]:
