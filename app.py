@@ -157,14 +157,44 @@ def extracted_text_stats(text: str) -> dict:
     }
 
 
-@st.cache_resource(show_spinner=False)
-def get_ocr_engine():
+_OCR_ENGINE = None
+_OCR_ENGINE_ATTEMPTED = False
+_OCR_ENGINE_ERROR = ""
+
+
+def get_ocr_engine(force_retry: bool = False):
+    global _OCR_ENGINE, _OCR_ENGINE_ATTEMPTED, _OCR_ENGINE_ERROR
+
+    if force_retry:
+        _OCR_ENGINE = None
+        _OCR_ENGINE_ATTEMPTED = False
+        _OCR_ENGINE_ERROR = ""
+
+    if _OCR_ENGINE_ATTEMPTED:
+        return _OCR_ENGINE
+
+    _OCR_ENGINE_ATTEMPTED = True
     if RapidOCR is None:
+        _OCR_ENGINE_ERROR = "rapidocr-onnxruntime is not importable in this Streamlit process."
         return None
+
     try:
-        return RapidOCR()
-    except Exception:
-        return None
+        _OCR_ENGINE = RapidOCR()
+    except Exception as exc:
+        _OCR_ENGINE = None
+        _OCR_ENGINE_ERROR = f"{type(exc).__name__}: {exc}"
+    return _OCR_ENGINE
+
+
+def ocr_backend_status() -> dict:
+    engine = get_ocr_engine()
+    return {
+        "python_executable": sys.executable,
+        "rapidocr_imported": RapidOCR is not None,
+        "pdfium_imported": pdfium is not None,
+        "ocr_engine_ready": engine is not None,
+        "ocr_engine_error": _OCR_ENGINE_ERROR or "",
+    }
 
 
 def ocr_available() -> bool:
@@ -217,11 +247,12 @@ def ocr_lines_from_result(result) -> list[str]:
     return lines
 
 
-def ocr_pdf_text(pdf_path: str) -> str:
+def ocr_pdf_text(pdf_path: str, ocr_engine=None) -> str:
     if pdfium is None:
         return ""
 
-    ocr_engine = get_ocr_engine()
+    if ocr_engine is None:
+        ocr_engine = get_ocr_engine()
     if ocr_engine is None:
         return ""
 
@@ -252,7 +283,10 @@ def extract_pdf_content(uploaded_file) -> dict:
                 "embedded_stats": embedded_stats,
             }
 
-        ocr_text = ocr_pdf_text(temp_path) if ocr_available() else ""
+        ocr_engine = get_ocr_engine()
+        if ocr_engine is None and RapidOCR is not None and pdfium is not None:
+            ocr_engine = get_ocr_engine(force_retry=True)
+        ocr_text = ocr_pdf_text(temp_path, ocr_engine=ocr_engine) if pdfium is not None else ""
         ocr_stats = extracted_text_stats(ocr_text)
         if ocr_stats["usable"]:
             return {
@@ -2813,6 +2847,7 @@ if audit_file and transcript_file and catalog_files:
     audit_data = parse_audit(audit_text) if audit_text_stats["usable"] else {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A"}
     catalog_df = parse_catalogs(catalog_files or [])
     program_profile = parse_program_profile(audit_text, catalog_files or [], transcript_data["major"])
+    ocr_status = ocr_backend_status()
     display_major = program_profile["display_label"]
     transcript_data["major"] = display_major
     transcript_data["program_profile"] = program_profile
@@ -2853,6 +2888,16 @@ if audit_file and transcript_file and catalog_files:
             st.error(
                 "The degree audit PDF did not yield usable text, even after fallback extraction, so remaining courses cannot be determined from it."
             )
+            if not ocr_status["ocr_engine_ready"]:
+                st.caption(
+                    "OCR fallback is not ready in this Streamlit process. "
+                    f"rapidocr_imported={ocr_status['rapidocr_imported']}, "
+                    f"pdfium_imported={ocr_status['pdfium_imported']}, "
+                    f"python={ocr_status['python_executable']}"
+                )
+                if ocr_status["ocr_engine_error"]:
+                    st.caption(f"OCR engine error: {ocr_status['ocr_engine_error']}")
+                st.info("If you just installed requirements, fully stop and restart Streamlit so the OCR backend reloads.")
         elif completion_state["is_complete"]:
             st.subheader("Graduation Status")
             st.success(completion_state["message"])
@@ -2912,6 +2957,7 @@ if audit_file and transcript_file and catalog_files:
                     "audit_method": audit_payload["method"],
                     "audit_embedded_text_chars": audit_payload["embedded_stats"]["char_count"],
                     "audit_final_text_chars": audit_text_stats["char_count"],
+                    "ocr_backend": ocr_status,
                 }
             )
 
