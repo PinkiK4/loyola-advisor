@@ -101,6 +101,14 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CATALOG_DEFAULT_COLUMNS = {
+    "Catalog Terms": "",
+    "Catalog Prereqs": "",
+    "Catalog Coreqs": "",
+    "Catalog Restrictions": "",
+    "Catalog Offering Notes": "",
+    "Catalog Rank": pd.NA,
+}
 
 
 def normalize_space(text: str) -> str:
@@ -348,10 +356,6 @@ def infer_sequenced_course(row: pd.Series, transcript_data: dict) -> pd.Series:
     return row
 
 
-def clean_catalog_title(title: str) -> str:
-    return clean_course_title(title)
-
-
 TITLE_STOPWORDS = {
     "and",
     "for",
@@ -504,6 +508,12 @@ def build_empty_schedule(overlap: dict | None = None) -> pd.DataFrame:
     empty_df.attrs["catalog_overlap_count"] = overlap["overlap_count"]
     empty_df.attrs["catalog_usable"] = overlap["usable"]
     return empty_df
+
+
+def apply_catalog_defaults(schedule_df: pd.DataFrame) -> pd.DataFrame:
+    for column, default_value in CATALOG_DEFAULT_COLUMNS.items():
+        schedule_df[column] = default_value
+    return schedule_df
 
 
 def infer_block_remaining(row: pd.Series) -> int:
@@ -988,10 +998,6 @@ def parse_program_profile(audit_text: str, catalog_files, transcript_major: str)
         "catalog_programs": catalog_programs,
         "display_label": " | ".join(display_parts) if display_parts else "Unknown",
     }
-
-
-def derive_program_major(audit_text: str, catalog_files, transcript_major: str) -> str:
-    return parse_program_profile(audit_text, catalog_files, transcript_major)["display_label"]
 
 
 def build_completion_state(transcript_data: dict, audit_data: dict, display_major: str, schedule_df: pd.DataFrame | None = None) -> dict:
@@ -2365,12 +2371,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         pending_df["Credits"] = pending_df["Catalog Credits"].fillna(3.0)
     else:
         pending_df["Credits"] = 3.0
-        pending_df["Catalog Terms"] = ""
-        pending_df["Catalog Prereqs"] = ""
-        pending_df["Catalog Coreqs"] = ""
-        pending_df["Catalog Restrictions"] = ""
-        pending_df["Catalog Offering Notes"] = ""
-        pending_df["Catalog Rank"] = pd.NA
+        pending_df = apply_catalog_defaults(pending_df)
 
     pending_df["Audit Term Index"] = pending_df["Audit Term"].apply(term_index)
     pending_df["Level"] = pending_df["Course ID"].str.extract(r"(\d{3})").astype(float)
