@@ -119,7 +119,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-10 GroupProject Gemini PDF fallback"
+APP_BUILD = "2026-04-10 GroupProject cloud OCR guidance"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -147,13 +147,16 @@ def normalize_course_code(subject: str, number: str) -> str:
     return f"{subject.strip().upper()} {number.strip()}"
 
 
-def extracted_text_stats(text: str) -> dict:
+def extracted_text_stats(text: str, min_lines: int = 3, dense_char_threshold: int | None = None) -> dict:
     meaningful_chars = len(re.sub(r"\s+", "", text))
     nonempty_lines = sum(1 for line in text.splitlines() if line.strip())
+    usable = meaningful_chars >= 40 and nonempty_lines >= min_lines
+    if not usable and dense_char_threshold is not None:
+        usable = meaningful_chars >= dense_char_threshold
     return {
         "char_count": meaningful_chars,
         "line_count": nonempty_lines,
-        "usable": meaningful_chars >= 40 and nonempty_lines >= 3,
+        "usable": usable,
     }
 
 
@@ -361,6 +364,8 @@ def extract_pdf_content(uploaded_file) -> dict:
                 "method": "embedded",
                 "stats": embedded_stats,
                 "embedded_stats": embedded_stats,
+                "ocr_stats": {"char_count": 0, "line_count": 0, "usable": False},
+                "gemini_stats": {"char_count": 0, "line_count": 0, "usable": False},
             }
 
         ocr_engine = get_ocr_engine()
@@ -374,16 +379,20 @@ def extract_pdf_content(uploaded_file) -> dict:
                 "method": "ocr",
                 "stats": ocr_stats,
                 "embedded_stats": embedded_stats,
+                "ocr_stats": ocr_stats,
+                "gemini_stats": {"char_count": 0, "line_count": 0, "usable": False},
             }
 
         gemini_text = gemini_extract_pdf_text(temp_path) if gemini_pdf_available() else ""
-        gemini_stats = extracted_text_stats(gemini_text)
+        gemini_stats = extracted_text_stats(gemini_text, min_lines=1, dense_char_threshold=120)
         if gemini_stats["usable"]:
             return {
                 "text": gemini_text,
                 "method": "gemini_pdf",
                 "stats": gemini_stats,
                 "embedded_stats": embedded_stats,
+                "ocr_stats": ocr_stats,
+                "gemini_stats": gemini_stats,
             }
 
         return {
@@ -391,6 +400,8 @@ def extract_pdf_content(uploaded_file) -> dict:
             "method": "none",
             "stats": gemini_stats if gemini_text else (ocr_stats if ocr_text else embedded_stats),
             "embedded_stats": embedded_stats,
+            "ocr_stats": ocr_stats,
+            "gemini_stats": gemini_stats,
         }
     finally:
         if os.path.exists(temp_path):
@@ -2882,6 +2893,11 @@ with st.sidebar:
             key="gemini_api_key_input",
             help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
         )
+        if not get_gemini_api_key():
+            st.warning(
+                "Add a Gemini API key here or in Streamlit secrets. "
+                "This deployment needs it for Gemini reasoning and PDF extraction fallback."
+            )
     else:
         default_model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
         ollama_model = st.text_input("Ollama model", value=default_model)
@@ -2992,6 +3008,9 @@ if audit_file and transcript_file and catalog_files:
                     st.caption(f"Gemini PDF fallback error: {ocr_status['gemini_pdf_error']}")
             else:
                 st.caption("Gemini PDF fallback is unavailable because no Gemini API key is configured for this session.")
+                st.error(
+                    "Enter a Gemini API key in the sidebar, or set GEMINI_API_KEY / GOOGLE_API_KEY in Streamlit secrets, then rerun the app."
+                )
             st.info("If you just installed requirements, fully stop and restart Streamlit so the OCR backend reloads.")
         elif completion_state["is_complete"]:
             st.subheader("Graduation Status")
@@ -3052,9 +3071,12 @@ if audit_file and transcript_file and catalog_files:
                 {
                     "transcript_method": transcript_payload["method"],
                     "transcript_embedded_text_chars": transcript_payload["embedded_stats"]["char_count"],
+                    "transcript_gemini_text_chars": transcript_payload.get("gemini_stats", {}).get("char_count", 0),
                     "transcript_final_text_chars": transcript_text_stats["char_count"],
                     "audit_method": audit_payload["method"],
                     "audit_embedded_text_chars": audit_payload["embedded_stats"]["char_count"],
+                    "audit_ocr_text_chars": audit_payload.get("ocr_stats", {}).get("char_count", 0),
+                    "audit_gemini_text_chars": audit_payload.get("gemini_stats", {}).get("char_count", 0),
                     "audit_final_text_chars": audit_text_stats["char_count"],
                     "ocr_backend": ocr_status,
                 }
