@@ -119,7 +119,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-10 GroupProject cloud OCR guidance"
+APP_BUILD = "2026-04-10 GroupProject audit repair"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -1499,14 +1499,25 @@ def parse_audit(text: str) -> dict:
         idx += 1
 
     requirements_df = pd.DataFrame(requirement_rows)
-    if requirements_df.empty:
-        return {"requirements_df": requirements_df, "audit_gpa": "N/A"}
-
-    requirements_df = requirements_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     audit_gpa_match = re.search(r"Cumulative GPA:\s*([\d.]+)", text, re.I)
     audit_gpa = audit_gpa_match.group(1) if audit_gpa_match else "N/A"
 
-    return {"requirements_df": requirements_df, "audit_gpa": audit_gpa}
+    if audit_parse_needs_gemini_repair(text, requirements_df):
+        repaired = parse_audit_with_gemini(text)
+        repaired_df = repaired.get("requirements_df", pd.DataFrame())
+        if not repaired_df.empty and len(repaired_df) > len(requirements_df):
+            return {
+                "requirements_df": repaired_df.drop_duplicates(subset=["Course ID", "Requirement Block"]),
+                "audit_gpa": repaired.get("audit_gpa", audit_gpa) or audit_gpa,
+                "parser_method": "gemini_structured",
+            }
+
+    if requirements_df.empty:
+        return {"requirements_df": requirements_df, "audit_gpa": audit_gpa, "parser_method": "heuristic"}
+
+    requirements_df = requirements_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+
+    return {"requirements_df": requirements_df, "audit_gpa": audit_gpa, "parser_method": "heuristic"}
 
 
 def extract_course_codes(text: str) -> list[str]:
@@ -2312,6 +2323,123 @@ def call_ai_json(system_prompt: str, user_payload: dict) -> dict:
     )
 
 
+def audit_parse_needs_gemini_repair(text: str, requirements_df: pd.DataFrame) -> bool:
+    text_stats = extracted_text_stats(text, min_lines=1, dense_char_threshold=2000)
+    if not text_stats["usable"]:
+        return False
+    if requirements_df.empty:
+        return True
+
+    unique_codes = requirements_df["Course ID"].nunique() if "Course ID" in requirements_df.columns else 0
+    has_only_language_placeholder = unique_codes == 1 and set(requirements_df["Course ID"].tolist()) == {"LANG 104"}
+    return len(requirements_df) < 8 or unique_codes < 5 or has_only_language_placeholder
+
+
+def normalize_gemini_audit_rows(rows: list[dict]) -> pd.DataFrame:
+    normalized_rows = []
+    block_order_map = {}
+    next_block_order = 1
+
+    for row in rows or []:
+        subject = normalize_space(str(row.get("subject", ""))).upper()
+        number = normalize_space(str(row.get("number", "")))
+        course_id = normalize_space(str(row.get("course_id", ""))).upper()
+        course_name = normalize_space(str(row.get("course_name", "")))
+        requirement_block = normalize_space(str(row.get("requirement_block", ""))) or "Degree Requirement"
+        requirement_area = normalize_space(str(row.get("requirement_area", ""))) or "Requirements"
+
+        if not course_id and subject and number:
+            course_id = normalize_course_code(subject, number)
+
+        if course_id == "LANG104":
+            course_id = "LANG 104"
+
+        if not re.match(r"^[A-Z]{2,4}\s+\d{3}[A-Z]?$", course_id):
+            continue
+
+        try:
+            block_remaining = row.get("block_remaining")
+            block_remaining = int(block_remaining) if block_remaining not in (None, "", "null") else None
+        except Exception:
+            block_remaining = None
+
+        try:
+            block_total = row.get("block_total")
+            block_total = int(block_total) if block_total not in (None, "", "null") else None
+        except Exception:
+            block_total = None
+
+        if requirement_block not in block_order_map:
+            block_order_map[requirement_block] = next_block_order
+            next_block_order += 1
+
+        normalized_rows.append(
+            {
+                "Audit Status": canonicalize_audit_status(str(row.get("audit_status", "Not Started"))),
+                "Course ID": course_id,
+                "Course Name": course_name or course_id,
+                "Audit Term": parse_audit_term_code(str(row.get("audit_term", ""))),
+                "Requirement Area": requirement_area,
+                "Requirement Block": requirement_block,
+                "Requirement Complete": row.get("requirement_complete"),
+                "Block Remaining": block_remaining,
+                "Block Total": block_total,
+                "Block Order": block_order_map[requirement_block],
+                "Is Elective Block": (
+                    "choose from" in requirement_block.lower()
+                    or re.search(r"complete\s+\d+\s+courses", requirement_block, re.I) is not None
+                ),
+            }
+        )
+
+    return pd.DataFrame(normalized_rows)
+
+
+def parse_audit_with_gemini(text: str) -> dict:
+    if not get_gemini_api_key():
+        return {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A"}
+
+    try:
+        result = call_gemini_json(
+            model=st.session_state.get("gemini_model", GEMINI_MODEL),
+            system_prompt=(
+                "You convert Loyola degree audit text into structured course requirement rows. "
+                "Return JSON only. Preserve document order. Extract every explicit course requirement row you can find, "
+                "including Completed, In Progress, Not Started, and Fulfilled rows. "
+                "Also extract the requirement area, requirement block, block completion counts like '1 of 3', and cumulative GPA. "
+                "If the audit includes the Foreign Language Intermediate II requirement without an explicit course code, "
+                "you may use course_id 'LANG 104' and course_name 'Intermediate II Language Course'."
+            ),
+            user_payload={
+                "audit_text": text[:45000],
+                "output_schema": {
+                    "audit_gpa": "string",
+                    "rows": [
+                        {
+                            "audit_status": "Completed|In Progress|Not Started|Fulfilled",
+                            "course_id": "SUBJ 123 or LANG 104",
+                            "subject": "optional string",
+                            "number": "optional string",
+                            "course_name": "string",
+                            "audit_term": "string",
+                            "requirement_area": "string",
+                            "requirement_block": "string",
+                            "requirement_complete": "boolean or null",
+                            "block_remaining": "integer or null",
+                            "block_total": "integer or null",
+                        }
+                    ],
+                },
+            },
+        )
+    except Exception:
+        return {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A"}
+
+    repaired_df = normalize_gemini_audit_rows(result.get("rows", []))
+    audit_gpa = normalize_space(str(result.get("audit_gpa", ""))) or "N/A"
+    return {"requirements_df": repaired_df, "audit_gpa": audit_gpa}
+
+
 def infer_subject_history(option_subjects: list[str], transcript_data: dict) -> dict[str, list[str]]:
     history = {subject: [] for subject in option_subjects}
     for course_code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"]):
@@ -2950,7 +3078,7 @@ if audit_file and transcript_file and catalog_files:
     audit_text_stats = audit_payload["stats"]
 
     transcript_data = parse_transcript(transcript_text)
-    audit_data = parse_audit(audit_text) if audit_text_stats["usable"] else {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A"}
+    audit_data = parse_audit(audit_text) if audit_text_stats["usable"] else {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A", "parser_method": "unusable"}
     catalog_df = parse_catalogs(catalog_files or [])
     program_profile = parse_program_profile(audit_text, catalog_files or [], transcript_data["major"])
     ocr_status = ocr_backend_status()
@@ -3074,6 +3202,7 @@ if audit_file and transcript_file and catalog_files:
                     "transcript_gemini_text_chars": transcript_payload.get("gemini_stats", {}).get("char_count", 0),
                     "transcript_final_text_chars": transcript_text_stats["char_count"],
                     "audit_method": audit_payload["method"],
+                    "audit_parser_method": audit_data.get("parser_method", "unknown"),
                     "audit_embedded_text_chars": audit_payload["embedded_stats"]["char_count"],
                     "audit_ocr_text_chars": audit_payload.get("ocr_stats", {}).get("char_count", 0),
                     "audit_gemini_text_chars": audit_payload.get("gemini_stats", {}).get("char_count", 0),
