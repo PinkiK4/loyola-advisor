@@ -119,7 +119,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-08 GroupProject OCR fix"
+APP_BUILD = "2026-04-10 GroupProject Gemini PDF fallback"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -160,6 +160,7 @@ def extracted_text_stats(text: str) -> dict:
 _OCR_ENGINE = None
 _OCR_ENGINE_ATTEMPTED = False
 _OCR_ENGINE_ERROR = ""
+_GEMINI_EXTRACTION_ERROR = ""
 
 
 def get_ocr_engine(force_retry: bool = False):
@@ -194,11 +195,17 @@ def ocr_backend_status() -> dict:
         "pdfium_imported": pdfium is not None,
         "ocr_engine_ready": engine is not None,
         "ocr_engine_error": _OCR_ENGINE_ERROR or "",
+        "gemini_key_available": bool(get_gemini_api_key()),
+        "gemini_pdf_error": _GEMINI_EXTRACTION_ERROR or "",
     }
 
 
 def ocr_available() -> bool:
     return pdfium is not None and get_ocr_engine() is not None
+
+
+def gemini_pdf_available() -> bool:
+    return bool(get_gemini_api_key())
 
 
 def extract_embedded_pdf_text(pdf_path: str) -> str:
@@ -207,6 +214,79 @@ def extract_embedded_pdf_text(pdf_path: str) -> str:
         for page in pdf.pages:
             extracted_pages.append(page.extract_text(x_tolerance=2, y_tolerance=3) or "")
         return soften_pdf_line_breaks("\n".join(extracted_pages))
+
+
+def gemini_extract_pdf_text(pdf_path: str) -> str:
+    global _GEMINI_EXTRACTION_ERROR
+    _GEMINI_EXTRACTION_ERROR = ""
+    api_key = get_gemini_api_key()
+    if not api_key:
+        _GEMINI_EXTRACTION_ERROR = "No Gemini API key is available for PDF fallback."
+        return ""
+
+    with open(pdf_path, "rb") as pdf_file:
+        pdf_b64 = base64.b64encode(pdf_file.read()).decode("ascii")
+
+    body = json.dumps(
+        {
+            "system_instruction": {
+                "parts": [
+                    {
+                        "text": (
+                            "You extract machine-readable text from academic PDF documents. "
+                            "Return plain text only. Preserve reading order, headings, course codes, "
+                            "grades, GPA values, and line breaks when possible. Do not summarize."
+                        )
+                    }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "inline_data": {
+                                "mime_type": "application/pdf",
+                                "data": pdf_b64,
+                            }
+                        },
+                        {
+                            "text": (
+                                "Extract all visible text from this PDF in reading order. "
+                                "Return plain text only."
+                            )
+                        },
+                    ],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 8192,
+            },
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{GEMINI_URL}/models/{st.session_state.get('gemini_model', GEMINI_MODEL)}:generateContent?key={api_key}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        candidate = (payload.get("candidates") or [{}])[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "\n".join(part.get("text", "") for part in parts if part.get("text"))
+        return soften_pdf_line_breaks(text)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        _GEMINI_EXTRACTION_ERROR = f"HTTP {exc.code}: {detail}"
+        return ""
+    except Exception as exc:
+        _GEMINI_EXTRACTION_ERROR = f"{type(exc).__name__}: {exc}"
+        return ""
 
 
 def ocr_lines_from_result(result) -> list[str]:
@@ -296,10 +376,20 @@ def extract_pdf_content(uploaded_file) -> dict:
                 "embedded_stats": embedded_stats,
             }
 
+        gemini_text = gemini_extract_pdf_text(temp_path) if gemini_pdf_available() else ""
+        gemini_stats = extracted_text_stats(gemini_text)
+        if gemini_stats["usable"]:
+            return {
+                "text": gemini_text,
+                "method": "gemini_pdf",
+                "stats": gemini_stats,
+                "embedded_stats": embedded_stats,
+            }
+
         return {
-            "text": embedded_text or ocr_text,
+            "text": embedded_text or ocr_text or gemini_text,
             "method": "none",
-            "stats": ocr_stats if ocr_text else embedded_stats,
+            "stats": gemini_stats if gemini_text else (ocr_stats if ocr_text else embedded_stats),
             "embedded_stats": embedded_stats,
         }
     finally:
@@ -2890,14 +2980,19 @@ if audit_file and transcript_file and catalog_files:
             )
             if not ocr_status["ocr_engine_ready"]:
                 st.caption(
-                    "OCR fallback is not ready in this Streamlit process. "
+                    "Local OCR fallback is not ready in this Streamlit process. "
                     f"rapidocr_imported={ocr_status['rapidocr_imported']}, "
                     f"pdfium_imported={ocr_status['pdfium_imported']}, "
                     f"python={ocr_status['python_executable']}"
                 )
                 if ocr_status["ocr_engine_error"]:
                     st.caption(f"OCR engine error: {ocr_status['ocr_engine_error']}")
-                st.info("If you just installed requirements, fully stop and restart Streamlit so the OCR backend reloads.")
+            if ocr_status["gemini_key_available"]:
+                if ocr_status["gemini_pdf_error"]:
+                    st.caption(f"Gemini PDF fallback error: {ocr_status['gemini_pdf_error']}")
+            else:
+                st.caption("Gemini PDF fallback is unavailable because no Gemini API key is configured for this session.")
+            st.info("If you just installed requirements, fully stop and restart Streamlit so the OCR backend reloads.")
         elif completion_state["is_complete"]:
             st.subheader("Graduation Status")
             st.success(completion_state["message"])
@@ -2917,8 +3012,12 @@ if audit_file and transcript_file and catalog_files:
             st.subheader("Recommended Schedule")
             if audit_payload["method"] == "ocr":
                 st.info("OCR fallback was used for the degree audit because its PDF text layer was not readable here.")
+            if audit_payload["method"] == "gemini_pdf":
+                st.info("Gemini PDF fallback was used for the degree audit because the local OCR backend was unavailable here.")
             if transcript_payload["method"] == "ocr":
                 st.info("OCR fallback was used for the transcript.")
+            if transcript_payload["method"] == "gemini_pdf":
+                st.info("Gemini PDF fallback was used for the transcript.")
             summary_text = build_schedule_summary(schedule_df, use_ai and not bool(ai_notes and "fallback used" in str(ai_notes[0]).lower()))
             if summary_text:
                 st.info(summary_text)
