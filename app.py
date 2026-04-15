@@ -119,7 +119,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-10 GroupProject audit repair"
+APP_BUILD = "2026-04-15 GroupProject remaining recovery"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -2440,6 +2440,74 @@ def parse_audit_with_gemini(text: str) -> dict:
     return {"requirements_df": repaired_df, "audit_gpa": audit_gpa}
 
 
+def parse_remaining_audit_with_gemini(text: str, transcript_data: dict, existing_audit_data: dict) -> dict:
+    if not get_gemini_api_key():
+        return {
+            "requirements_df": pd.DataFrame(),
+            "audit_gpa": existing_audit_data.get("audit_gpa", "N/A"),
+            "parser_method": "remaining_recovery_unavailable",
+        }
+
+    try:
+        result = call_gemini_json(
+            model=st.session_state.get("gemini_model", GEMINI_MODEL),
+            system_prompt=(
+                "You extract only the student's remaining unmet degree requirements from a Loyola degree audit. "
+                "Use the transcript course history to avoid returning completed courses. "
+                "Return only courses that still need scheduling attention: Not Started, In Progress, Planned, Registered, "
+                "or future audit requirements not already completed on the transcript. "
+                "Do not return historical completed rows unless they are the only evidence of a remaining progress count. "
+                "Return JSON only."
+            ),
+            user_payload={
+                "audit_text": text[:45000],
+                "transcript_completed_courses": sorted(transcript_data.get("taken_codes", set())),
+                "transcript_in_progress_courses": sorted(transcript_data.get("in_progress_codes", set())),
+                "output_schema": {
+                    "audit_gpa": "string",
+                    "rows": [
+                        {
+                            "audit_status": "Not Started|In Progress",
+                            "course_id": "SUBJ 123 or LANG 104",
+                            "subject": "optional string",
+                            "number": "optional string",
+                            "course_name": "string",
+                            "audit_term": "string",
+                            "requirement_area": "string",
+                            "requirement_block": "string",
+                            "requirement_complete": False,
+                            "block_remaining": "integer or null",
+                            "block_total": "integer or null",
+                        }
+                    ],
+                },
+            },
+        )
+    except Exception:
+        return {
+            "requirements_df": pd.DataFrame(),
+            "audit_gpa": existing_audit_data.get("audit_gpa", "N/A"),
+            "parser_method": "remaining_recovery_failed",
+        }
+
+    recovered_df = normalize_gemini_audit_rows(result.get("rows", []))
+    if recovered_df.empty:
+        return {
+            "requirements_df": recovered_df,
+            "audit_gpa": existing_audit_data.get("audit_gpa", "N/A"),
+            "parser_method": "remaining_recovery_empty",
+        }
+
+    recovered_df["Requirement Complete"] = False
+    recovered_df["Audit Status"] = recovered_df["Audit Status"].replace({"Fulfilled": "Not Started", "Completed": "Not Started"})
+    audit_gpa = normalize_space(str(result.get("audit_gpa", ""))) or existing_audit_data.get("audit_gpa", "N/A")
+    return {
+        "requirements_df": recovered_df.drop_duplicates(subset=["Course ID", "Requirement Block"]),
+        "audit_gpa": audit_gpa,
+        "parser_method": "gemini_remaining_recovery",
+    }
+
+
 def infer_subject_history(option_subjects: list[str], transcript_data: dict) -> dict[str, list[str]]:
     history = {subject: [] for subject in option_subjects}
     for course_code in transcript_data["taken_codes"].union(transcript_data["in_progress_codes"]):
@@ -2973,6 +3041,25 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     return finalized_df, ai_notes
 
 
+def should_attempt_remaining_recovery(
+    transcript_data: dict,
+    audit_data: dict,
+    audit_payload: dict,
+    schedule_df: pd.DataFrame,
+) -> bool:
+    if not schedule_df.empty:
+        return False
+    if audit_payload.get("method") != "gemini_pdf":
+        return False
+    if float(transcript_data.get("total") or 0) >= 100:
+        return False
+    requirements_df = audit_data.get("requirements_df", pd.DataFrame())
+    if requirements_df.empty:
+        return True
+    unique_codes = requirements_df["Course ID"].nunique() if "Course ID" in requirements_df.columns else 0
+    return len(requirements_df) < 8 or unique_codes < 5
+
+
 def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
     pdf = FPDF()
     pdf.add_page()
@@ -3091,6 +3178,14 @@ if audit_file and transcript_file and catalog_files:
         audit_data,
     )
     schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
+    recovery_used = False
+    if should_attempt_remaining_recovery(transcript_data, audit_data, audit_payload, schedule_df):
+        recovered_audit_data = parse_remaining_audit_with_gemini(audit_text, transcript_data, audit_data)
+        recovered_df = recovered_audit_data.get("requirements_df", pd.DataFrame())
+        if not recovered_df.empty:
+            audit_data = recovered_audit_data
+            schedule_df, ai_notes = build_schedule(transcript_data, audit_data, catalog_df, use_ai=use_ai)
+            recovery_used = not schedule_df.empty
     completion_state = build_completion_state(transcript_data, audit_data, display_major, schedule_df)
 
     transcript_gpa = transcript_data["qpa"]
@@ -3154,13 +3249,20 @@ if audit_file and transcript_file and catalog_files:
             )
         elif schedule_df.empty:
             st.subheader("Recommended Schedule")
-            st.success("No remaining courses were detected from the audit.")
+            if should_attempt_remaining_recovery(transcript_data, audit_data, audit_payload, schedule_df):
+                st.warning(
+                    "The audit text was extracted, but the remaining-requirements parse still came back too sparse to trust as a true zero-course result."
+                )
+            else:
+                st.success("No remaining courses were detected from the audit.")
         else:
             st.subheader("Recommended Schedule")
             if audit_payload["method"] == "ocr":
                 st.info("OCR fallback was used for the degree audit because its PDF text layer was not readable here.")
             if audit_payload["method"] == "gemini_pdf":
                 st.info("Gemini PDF fallback was used for the degree audit because the local OCR backend was unavailable here.")
+            if recovery_used:
+                st.info("Structured Gemini recovery was used to rebuild the remaining requirement list from the audit text.")
             if transcript_payload["method"] == "ocr":
                 st.info("OCR fallback was used for the transcript.")
             if transcript_payload["method"] == "gemini_pdf":
