@@ -119,7 +119,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-15 GroupProject remaining recovery"
+APP_BUILD = "2026-04-15 GroupProject remaining recovery v2"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -2448,21 +2448,34 @@ def parse_remaining_audit_with_gemini(text: str, transcript_data: dict, existing
             "parser_method": "remaining_recovery_unavailable",
         }
 
-    try:
-        result = call_gemini_json(
+    def recover_rows(aggressive: bool = False) -> dict:
+        system_prompt = (
+            "You extract only the student's remaining unmet degree requirements from a Loyola degree audit. "
+            "Use the transcript course history to avoid returning completed courses. "
+            "Return only courses that still need scheduling attention: Not Started, In Progress, Planned, Registered, "
+            "or future audit requirements not already completed on the transcript. "
+            "Do not return historical completed rows unless they are the only evidence of a remaining progress count. "
+            "Return JSON only."
+        )
+        if aggressive:
+            system_prompt += (
+                " This audit appears to have many remaining requirements. "
+                "Do not summarize down to just one or two sample courses. "
+                "Extract candidate course rows across every incomplete requirement area you can see, including University Core, "
+                "major-specific engineering/electrical engineering requirements, electives, capstones, and language/core blocks. "
+                "If a block offers multiple course choices and one course remains, include up to 3 valid candidate course rows for that block."
+            )
+
+        return call_gemini_json(
             model=st.session_state.get("gemini_model", GEMINI_MODEL),
-            system_prompt=(
-                "You extract only the student's remaining unmet degree requirements from a Loyola degree audit. "
-                "Use the transcript course history to avoid returning completed courses. "
-                "Return only courses that still need scheduling attention: Not Started, In Progress, Planned, Registered, "
-                "or future audit requirements not already completed on the transcript. "
-                "Do not return historical completed rows unless they are the only evidence of a remaining progress count. "
-                "Return JSON only."
-            ),
+            system_prompt=system_prompt,
             user_payload={
                 "audit_text": text[:45000],
+                "student_major": transcript_data.get("major", ""),
+                "earned_credits": transcript_data.get("total", 0),
                 "transcript_completed_courses": sorted(transcript_data.get("taken_codes", set())),
                 "transcript_in_progress_courses": sorted(transcript_data.get("in_progress_codes", set())),
+                "minimum_expected_rows": 6 if float(transcript_data.get("total") or 0) < 100 else 3,
                 "output_schema": {
                     "audit_gpa": "string",
                     "rows": [
@@ -2483,6 +2496,9 @@ def parse_remaining_audit_with_gemini(text: str, transcript_data: dict, existing
                 },
             },
         )
+
+    try:
+        result = recover_rows(aggressive=False)
     except Exception:
         return {
             "requirements_df": pd.DataFrame(),
@@ -2491,6 +2507,17 @@ def parse_remaining_audit_with_gemini(text: str, transcript_data: dict, existing
         }
 
     recovered_df = normalize_gemini_audit_rows(result.get("rows", []))
+    minimum_expected_rows = 6 if float(transcript_data.get("total") or 0) < 100 else 3
+    if len(recovered_df) < minimum_expected_rows:
+        try:
+            aggressive_result = recover_rows(aggressive=True)
+            aggressive_df = normalize_gemini_audit_rows(aggressive_result.get("rows", []))
+            if len(aggressive_df) > len(recovered_df):
+                result = aggressive_result
+                recovered_df = aggressive_df
+        except Exception:
+            pass
+
     if recovered_df.empty:
         return {
             "requirements_df": recovered_df,
