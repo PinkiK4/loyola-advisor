@@ -93,7 +93,16 @@ def set_style(img_file: str) -> None:
 set_style("Background.jpeg")
 
 
-STATUS_WORDS = ("Completed", "Not Started", "In Progress", "Fulfi lled", "Fulfilled")
+STATUS_WORDS = (
+    "Completed",
+    "Not Started",
+    "In Progress",
+    "Registered",
+    "Planned",
+    "Attempted",
+    "Fulfi lled",
+    "Fulfilled",
+)
 GRADE_TOKENS = {
     "A",
     "A-",
@@ -119,10 +128,22 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-15 GroupProject remaining recovery v2"
+APP_BUILD = "2026-04-25 GroupProject relevant retakes v1"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
+TERM_SORT_ORDER = {"Winter": 0, "Spring": 1, "Summer": 2, "Fall": 3}
+LANGUAGE_SUBJECT_CODES = {"AB", "CI", "FR", "GK", "GR", "IT", "LT", "SN"}
+LANGUAGE_NAME_KEYWORDS = {
+    "arabic": "AB",
+    "chinese": "CI",
+    "french": "FR",
+    "greek": "GR",
+    "german": "GR",
+    "italian": "IT",
+    "latin": "LT",
+    "spanish": "SN",
+}
 GRADE_PATTERN = "|".join(sorted((re.escape(token) for token in GRADE_TOKENS), key=len, reverse=True))
 TERM_PATTERN = re.compile(r"\b(Fall|Spring|Summer|Winter)\s+\d{2}\b", re.I)
 TRANSCRIPT_COURSE_START_PATTERN = re.compile(r"\b([A-Z]{2,4})\s+(\d{3}[A-Z]?)\s+([A-Z0-9]{2,3})\b")
@@ -424,6 +445,65 @@ def course_counts_as_completed(grade: str, credits: float) -> bool:
     return credits > 0
 
 
+def course_is_not_passed(grade: str, credits: float) -> bool:
+    normalized_grade = str(grade or "").strip().upper()
+    if normalized_grade in IN_PROGRESS_GRADES:
+        return False
+    return not course_counts_as_completed(grade, credits)
+
+
+def transcript_term_sort_key(term_label: str) -> int:
+    match = re.match(r"^(Fall|Spring|Summer|Winter)\s+(\d{2})$", normalize_space(str(term_label)), re.I)
+    if not match:
+        return -1
+    season = match.group(1).title()
+    year = int(match.group(2))
+    return year * 10 + TERM_SORT_ORDER.get(season, 0)
+
+
+def latest_attempts_by_course(courses_df: pd.DataFrame) -> pd.DataFrame:
+    if courses_df.empty:
+        return courses_df.copy()
+
+    attempts_df = courses_df.copy()
+    attempts_df["Term Sort"] = attempts_df["Term"].map(transcript_term_sort_key)
+    attempts_df["Attempt Order"] = range(len(attempts_df))
+    attempts_df = attempts_df.sort_values(by=["Term Sort", "Attempt Order"], ascending=[True, True])
+    return attempts_df.drop_duplicates(subset=["Course ID"], keep="last")
+
+
+def detect_language_subject(course_code: str, course_name: str = "") -> str | None:
+    match = re.match(r"^([A-Z]{2,5})\s+\d{3}", str(course_code).strip())
+    if match and match.group(1) in LANGUAGE_SUBJECT_CODES:
+        return match.group(1)
+
+    normalized_name = normalize_space(course_name).lower()
+    for keyword, mapped_subject in LANGUAGE_NAME_KEYWORDS.items():
+        if keyword in normalized_name:
+            return mapped_subject
+    return None
+
+
+def normalize_audit_text_for_parsing(text: str) -> str:
+    normalized = text
+    normalized = re.sub(
+        r"\b(Take|Complete)([A-Z]{2,4})\*?(\d{3}[A-Z]?)\b",
+        r"\1 \2 \3",
+        normalized,
+        flags=re.I,
+    )
+    split_patterns = [
+        r"(?<!\n)(?=\b(?:Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Not Started|Attempted|Fulfi\s*lled|Fulfilled)\s+[A-Z]{2,4}\*?\d{3}[A-ZW]?\b)",
+        r"(?<!\n)(?=\b(?:Take|Complete)[A-Z]{2,4}\*?\d{3}[A-ZW]?\b)",
+        r"(?<!\n)(?=\b\d+\.\s+(?:Take|Complete)\b)",
+        r"(?<!\n)(?=\b(?:University Core|Diversity Requirement|Engineering, Electrical Engineering|Other Courses)\b)",
+        r"(?<!\n)(?=\b[A-Z]\.[A-Za-z])",
+    ]
+    for pattern in split_patterns:
+        normalized = re.sub(pattern, "\n", normalized, flags=re.I)
+    return normalized
+
+
 def canonicalize_audit_status(text: str) -> str:
     normalized = normalize_space(text.replace("-", ""))
     lowered = normalized.lower()
@@ -436,6 +516,12 @@ def canonicalize_audit_status(text: str) -> str:
         return "Fulfilled"
     if compact in {"notstarted"}:
         return "Not Started"
+    if compact in {"registered"}:
+        return "Registered"
+    if compact in {"planned"}:
+        return "Planned"
+    if compact in {"attempted"}:
+        return "Attempted"
     return normalized.title()
 
 
@@ -456,10 +542,46 @@ def clean_course_title(title: str) -> str:
     cleaned = re.sub(r"(?<=\s)(?:A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)(?=\s+[A-Z])", "", cleaned)
     cleaned = re.sub(r"\b(Freshman Year|Sophomore Year|Junior Year|Senior Year|Elective Component|Foundational Component|DS Elective)\b.*$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(Program:|Requirements for the Major|Status Course Grade Term Credits)\b.*$", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(Completed|In Progress|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(Completed|In Progress|Registered|Planned|Attempted|Not Started|Fulfilled)\b$", "", cleaned, flags=re.I)
     cleaned = re.sub(r"(?:\s|^)(A|A-|B\+|B|B-|C\+|C|C-|D\+|D|D-|F|P|S|U|W|IP|CIP)$", "", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned.rstrip(" -,:;")
+
+
+def audit_row_looks_corrupted(row: pd.Series) -> bool:
+    course_id = normalize_space(str(row.get("Course ID", "")))
+    course_name = normalize_space(str(row.get("Course Name", "")))
+    requirement_block = normalize_space(str(row.get("Requirement Block", "")))
+    audit_status = normalize_space(str(row.get("Audit Status", "")))
+    lowered_name = course_name.lower()
+    lowered_block = requirement_block.lower()
+    suspicious_phrases = [
+        "this listing is not an official degree audit",
+        "review and approval for graduation",
+        "report any problems",
+        "minimum of at least 120 credits",
+        "fulfills the university",
+    ]
+    suspicious_block_phrases = [
+        "fullyplanned",
+        "oof1completed",
+    ]
+
+    if course_id and not re.match(r"^[A-Z]{2,4}\s+\d{3}[A-Z]?$", course_id):
+        return True
+    if any(phrase in lowered_name for phrase in suspicious_phrases):
+        return True
+    if any(phrase in lowered_block for phrase in suspicious_block_phrases):
+        return True
+    if len(course_name) > 120:
+        return True
+    if re.match(r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Attempted)\s+[A-Z]{2,4}\*?\d{3}", requirement_block, re.I):
+        return True
+    if audit_status in {"Registered", "Planned", "Attempted"} and lowered_block.startswith("completed "):
+        return True
+    if audit_status in {"Registered", "Planned", "Attempted"} and re.search(r"\b[A-Z]{2,4}\*?\d{3}\b", course_name):
+        return True
+    return False
 
 
 def strip_catalog_title_noise(title: str) -> str:
@@ -538,6 +660,9 @@ def get_latest_transcript_term(transcript_data: dict):
 def requirement_category_priority(requirement_area: str, requirement_block: str, requirement_complete) -> int:
     area = (requirement_area or "").lower()
     block = (requirement_block or "").lower()
+
+    if "retake needed" in area or "not yet passed" in block:
+        return -1
 
     if requirement_complete is True:
         base = 2
@@ -768,8 +893,11 @@ def default_course_reason(row: pd.Series) -> str:
     block = str(row.get("Requirement Block", ""))
     area = str(row.get("Requirement Area", ""))
     recommended_term = str(row.get("Recommended Term", ""))
+    audit_status = str(row.get("Audit Status", ""))
     is_elective = bool(row.get("Is Elective Block", False))
 
+    if audit_status == "Retake Needed":
+        return f"{course_id} should be repeated because the latest transcript attempt did not satisfy the requirement."
     if recommended_term == "Current Term":
         return f"{course_id} is already on the active path for the current term and remains part of the strongest requirement sequence."
     if "DS 496" == course_id:
@@ -1074,7 +1202,7 @@ def should_merge_pdf_line(previous_line: str, current_line: str) -> bool:
         return False
 
     previous_structural_patterns = [
-        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+[A-Z]{2,4}\*?\d{3}\b",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Attempted|Not Started|Fulfi\s*lled|Fulfilled)\s+[A-Z]{2,4}\*?\d{3}\b",
         r"^(Transfer Equivalency)\s+[A-Z]{2,4}\*?\d{3}\b",
         r"^https?://",
         r"^My Progress\b",
@@ -1089,7 +1217,7 @@ def should_merge_pdf_line(previous_line: str, current_line: str) -> bool:
         r"^(Status|Total|Term|Degree|Major|Catalog|Description|Requirements|Progress|Specializations|Departments|Majors)\b",
         r"^\d+\.\s+",
         r"^[A-Z]\.\s+",
-        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\b",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Attempted|Not Started|Fulfi\s*lled|Fulfilled)\b",
         r"^(Transfer Equivalency)\b",
         r"^[A-Z]{2,4}\*?\s*\d{3}\b",
         r"^Page:\s+\d+",
@@ -1117,7 +1245,7 @@ def is_likely_title_continuation(line: str) -> bool:
         return False
     if any(token in cleaned for token in ("http://", "https://", "Page ", "Status Course Grade Term Credits")):
         return False
-    if re.match(r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\b", cleaned, re.I):
+    if re.match(r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Attempted|Not Started|Fulfi\s*lled|Fulfilled)\b", cleaned, re.I):
         return False
     if re.match(r"^\d+\.\s+(Take|Complete)\b", cleaned, re.I):
         return False
@@ -1218,6 +1346,7 @@ def parse_transcript(text: str) -> dict:
         gpa = f"{nonzero_qpas[-1]:.3f}"
 
     courses_df = pd.DataFrame(course_rows)
+    latest_attempts_df = latest_attempts_by_course(courses_df)
     completed_codes = (
         set(
             courses_df.loc[
@@ -1232,10 +1361,22 @@ def parse_transcript(text: str) -> dict:
         else set()
     )
     in_progress_codes = (
-        set(courses_df.loc[courses_df["Grade"].isin(IN_PROGRESS_GRADES), "Course ID"].tolist())
-        if not courses_df.empty
+        set(latest_attempts_df.loc[latest_attempts_df["Grade"].isin(IN_PROGRESS_GRADES), "Course ID"].tolist())
+        if not latest_attempts_df.empty
         else set()
     )
+    not_passed_df = (
+        latest_attempts_df.loc[
+            latest_attempts_df.apply(
+                lambda row: course_is_not_passed(row["Grade"], float(row["Credits"])),
+                axis=1,
+            )
+            & ~latest_attempts_df["Course ID"].isin(completed_codes)
+        ].copy()
+        if not latest_attempts_df.empty
+        else latest_attempts_df.copy()
+    )
+    not_passed_codes = set(not_passed_df["Course ID"].tolist()) if not not_passed_df.empty else set()
     progression_codes = completed_codes | in_progress_codes
 
     return {
@@ -1245,6 +1386,9 @@ def parse_transcript(text: str) -> dict:
         "qpa": gpa,
         "total": total_credits,
         "courses_df": courses_df,
+        "latest_attempts_df": latest_attempts_df,
+        "not_passed_df": not_passed_df,
+        "not_passed_codes": not_passed_codes,
         "taken_codes": completed_codes,
         "completed_codes": completed_codes,
         "progression_codes": progression_codes,
@@ -1350,6 +1494,7 @@ def build_completion_state(transcript_data: dict, audit_data: dict, display_majo
 
 
 def parse_audit(text: str) -> dict:
+    text = normalize_audit_text_for_parsing(text)
     lines = [line.rstrip() for line in text.splitlines()]
     requirement_rows = []
     current_section = "Requirements"
@@ -1360,8 +1505,10 @@ def parse_audit(text: str) -> dict:
     block_order = 0
     language_placeholder_added = False
     section_pattern = re.compile(r"^[A-Z][A-Za-z/&,\-\s]{3,}$")
+    block_line_pattern = re.compile(r"^(?:\d+\.\s+)?(?:Take|Complete)\b", re.I)
+    compact_block_line_pattern = re.compile(r"^(?:Take|Complete)[A-Z0-9*]", re.I)
     course_line_pattern = re.compile(
-        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Not Started|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?(\d{3})(?:\s+(.+))?$",
+        r"^(Completed|Com\s*pleted|In[-\s]*Pr\s*ogress|Registered|Planned|Attempted|Not Started|Fulfi\s*lled|Fulfilled)\s+([A-Z]{2,4})\*?\s?(\d{3}[A-Z]?)(?:\s+(.+))?$",
         re.I,
     )
     block_progress_pattern = re.compile(
@@ -1387,12 +1534,19 @@ def parse_audit(text: str) -> dict:
             idx += 1
             continue
 
-        if line.startswith("Take ") or re.match(r"^\d+\.\s+(Take|Complete) ", line):
+        if block_line_pattern.match(line) or compact_block_line_pattern.match(line):
             current_block = normalize_space(line)
             block_order += 1
             current_block_complete = bool(re.search(r"Fulfi\s*lled$", line, re.I))
             current_block_remaining = None
             current_block_total = None
+            progress_match = block_progress_pattern.search(line)
+            if progress_match:
+                completed = int(progress_match.group(1))
+                total = int(progress_match.group(2))
+                current_block_complete = completed >= total
+                current_block_remaining = max(total - completed, 0)
+                current_block_total = total
             if (
                 "Foreign Language course" in current_block
                 and "Intermediate II" in current_block
@@ -1453,8 +1607,8 @@ def parse_audit(text: str) -> dict:
                 continue
             if (
                 "Status Course Grade Term Credits" in next_line
-                or next_line.startswith("Take ")
-                or re.match(r"^\d+\.\s+(Take|Complete) ", next_line)
+                or block_line_pattern.match(next_line)
+                or compact_block_line_pattern.match(next_line)
                 or next_line == "Not Started"
                 or any(next_line.startswith(prefix) for prefix in STATUS_WORDS)
                 or course_line_pattern.match(next_line)
@@ -1499,6 +1653,8 @@ def parse_audit(text: str) -> dict:
         idx += 1
 
     requirements_df = pd.DataFrame(requirement_rows)
+    if not requirements_df.empty:
+        requirements_df = requirements_df[~requirements_df.apply(audit_row_looks_corrupted, axis=1)].copy()
     audit_gpa_match = re.search(r"Cumulative GPA:\s*([\d.]+)", text, re.I)
     audit_gpa = audit_gpa_match.group(1) if audit_gpa_match else "N/A"
 
@@ -2078,34 +2234,43 @@ def catalog_overlap_summary(catalog_df: pd.DataFrame, transcript_data: dict, aud
 
 
 def infer_language_subject(transcript_data: dict) -> str | None:
-    if transcript_data["courses_df"].empty:
+    latest_attempts_df = transcript_data.get("latest_attempts_df", pd.DataFrame())
+    courses_df = transcript_data.get("courses_df", pd.DataFrame())
+    if latest_attempts_df.empty and courses_df.empty:
         return None
 
-    language_like = []
-    for code in transcript_data["courses_df"]["Course ID"].tolist():
-        match = re.match(r"^([A-Z]{2,4})\s+(\d{3})$", str(code))
-        if not match:
+    in_progress_subjects = []
+    for _, row in latest_attempts_df.iterrows():
+        if str(row.get("Grade", "")).strip().upper() not in IN_PROGRESS_GRADES:
             continue
-        subject, number = match.groups()
-        if int(number) < 200:
-            language_like.append(subject)
+        subject = detect_language_subject(str(row.get("Course ID", "")), str(row.get("Course Name", "")))
+        if subject:
+            in_progress_subjects.append(subject)
+    if in_progress_subjects:
+        return sorted(in_progress_subjects)[0]
 
-    if not language_like:
+    subject_counts = {}
+    subject_levels = {}
+    source_df = courses_df if not courses_df.empty else latest_attempts_df
+    for _, row in source_df.iterrows():
+        course_id = str(row.get("Course ID", ""))
+        course_name = str(row.get("Course Name", ""))
+        subject = detect_language_subject(course_id, course_name)
+        if not subject:
+            continue
+        subject_counts[subject] = subject_counts.get(subject, 0) + 1
+        number_match = re.search(r"(\d{3})", course_id)
+        if number_match:
+            subject_levels[subject] = max(subject_levels.get(subject, 0), int(number_match.group(1)))
+
+    if not subject_counts:
         return None
 
-    in_progress = []
-    for code in transcript_data["in_progress_codes"]:
-        match = re.match(r"^([A-Z]{2,4})\s+(\d{3})$", str(code))
-        if not match:
-            continue
-        subject, number = match.groups()
-        if int(number) < 200:
-            in_progress.append(subject)
-    if in_progress:
-        return sorted(in_progress)[0]
-
-    counts = pd.Series(language_like).value_counts()
-    return str(counts.index[0]) if not counts.empty else None
+    ranked_subjects = sorted(
+        subject_counts,
+        key=lambda subject: (-subject_counts[subject], -subject_levels.get(subject, 0), subject),
+    )
+    return ranked_subjects[0] if ranked_subjects else None
 
 
 def extract_allowed_subjects(requirement_block: str) -> set[str]:
@@ -2160,6 +2325,126 @@ def lock_language_blocks_to_transcript_subject(pending_df: pd.DataFrame, transcr
             locked_groups.append(group)
 
     return pd.concat(locked_groups, ignore_index=True) if locked_groups else pending_df
+
+
+def is_primary_language_requirement_row(row: pd.Series | dict) -> bool:
+    course_id = str(row.get("Course ID", ""))
+    course_name = str(row.get("Course Name", ""))
+    requirement_block = normalize_space(str(row.get("Requirement Block", ""))).lower()
+    requirement_area = normalize_space(str(row.get("Requirement Area", ""))).lower()
+    subject = detect_language_subject(course_id, course_name)
+    area_subject = detect_language_subject("", requirement_area)
+    number_match = re.search(r"(\d{3})", course_id)
+    is_lower_language = subject is not None and number_match is not None and int(number_match.group(1)) < 200
+
+    if course_id == "LANG 104":
+        return True
+    if "foreign language" in requirement_block or "intermediate ii" in requirement_block or "language 200-level" in requirement_block:
+        return True
+    if is_lower_language and ("waiver" in course_name.lower() or area_subject is not None):
+        return True
+    if is_lower_language and ("university core" in requirement_area or "core" in requirement_block or "language" in requirement_block):
+        return True
+    return False
+
+
+def append_transcript_retake_rows(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
+    not_passed_df = transcript_data.get("not_passed_df", pd.DataFrame())
+    not_passed_codes = set(transcript_data.get("not_passed_codes", set()))
+    if not not_passed_codes:
+        return pending_df
+
+    pending_df = pending_df.copy()
+    if not pending_df.empty and "Course ID" in pending_df.columns:
+        existing_mask = pending_df["Course ID"].isin(not_passed_codes)
+        if existing_mask.any():
+            pending_df.loc[existing_mask, "Audit Status"] = "Retake Needed"
+            pending_df.loc[existing_mask, "Requirement Complete"] = False
+            pending_df.loc[existing_mask, "Block Remaining"] = pending_df.loc[existing_mask, "Block Remaining"].fillna(1)
+            pending_df.loc[existing_mask, "Block Total"] = pending_df.loc[existing_mask, "Block Total"].fillna(1)
+            pending_df.loc[existing_mask, "Is Elective Block"] = pending_df.loc[existing_mask, "Is Elective Block"].fillna(False)
+
+    existing_codes = set(pending_df["Course ID"].tolist()) if not pending_df.empty and "Course ID" in pending_df.columns else set()
+    retake_rows = []
+    for _, row in not_passed_df.iterrows():
+        course_id = str(row.get("Course ID", "")).strip()
+        if not course_id or course_id in existing_codes:
+            continue
+        credits = row.get("Credits", 3.0)
+        try:
+            credits = float(credits)
+        except Exception:
+            credits = 3.0
+        retake_rows.append(
+            {
+                "Audit Status": "Retake Needed",
+                "Course ID": course_id,
+                "Course Name": clean_course_title(str(row.get("Course Name", ""))) or course_id,
+                "Audit Term": "",
+                "Requirement Area": "Retake Needed",
+                "Requirement Block": "Transcript course not yet passed",
+                "Requirement Complete": False,
+                "Block Remaining": 1,
+                "Block Total": 1,
+                "Block Order": 999,
+                "Is Elective Block": False,
+                "Credits": credits,
+            }
+        )
+
+    if not retake_rows:
+        return pending_df
+
+    return pd.concat([pending_df, pd.DataFrame(retake_rows)], ignore_index=True)
+
+
+def collapse_language_requirement_options(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
+    if pending_df.empty:
+        return pending_df
+
+    primary_language_mask = pending_df.apply(is_primary_language_requirement_row, axis=1)
+    if int(primary_language_mask.sum()) <= 1:
+        return pending_df
+
+    preferred_subject = infer_language_subject(transcript_data)
+    language_df = pending_df.loc[primary_language_mask].copy()
+    language_df["Language Status Priority"] = language_df["Audit Status"].map(
+        {"Retake Needed": 0, "In Progress": 1, "Registered": 2, "Planned": 3, "Attempted": 4, "Not Started": 5}
+    ).fillna(6)
+    language_df["Language Preferred Priority"] = language_df["Course ID"].apply(
+        lambda code: (
+            0
+            if preferred_subject and str(code).startswith(f"{preferred_subject} ")
+            else (2 if str(code) == "LANG 104" else 1)
+        )
+    )
+    language_df["Language Sequence Priority"] = language_df["Course ID"].apply(
+        lambda code: sequence_gap_priority(str(code), transcript_data)
+    )
+    language_df["Language Waiver Priority"] = language_df["Course Name"].str.contains("waiver", case=False, na=False).map({True: 1, False: 0})
+    language_df["Language Level"] = pd.to_numeric(
+        language_df["Course ID"].str.extract(r"(\d{3})")[0],
+        errors="coerce",
+    ).fillna(999)
+    best_language_index = (
+        language_df.sort_values(
+            by=[
+                "Language Status Priority",
+                "Language Preferred Priority",
+                "Language Waiver Priority",
+                "Language Sequence Priority",
+                "Language Level",
+                "Course ID",
+            ],
+            ascending=[True, True, True, True, True, True],
+        )
+        .index[0]
+    )
+    filtered_df = pd.concat(
+        [pending_df.loc[~primary_language_mask], pending_df.loc[[best_language_index]]],
+        ignore_index=True,
+    )
+    return filtered_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
 
 
 def drop_block_alternatives_covered_by_in_progress(
@@ -2775,6 +3060,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "Choose the strongest next-semester schedule from the candidate courses. "
             "Keep the total as close to 15 credits as possible without going over, unless fewer than 4 valid courses exist. "
             "Prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
+            "and treat any candidate with Audit Status = Retake Needed as a high-priority repeat unless stronger current-term obligations already fill the load. "
             "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
             "If the student has multiple majors, specializations, or minors, preserve a balanced forward path across those programs without double-counting overlapping courses. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
@@ -2841,10 +3127,13 @@ def ai_schedule_is_valid(candidate_df: pd.DataFrame, optimized_df: pd.DataFrame)
 
 def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataFrame, use_ai: bool = False):
     requirements_df = audit_data["requirements_df"]
+    overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
     if requirements_df.empty:
-        return pd.DataFrame(), []
-
-    pending_df = requirements_df.copy()
+        pending_df = append_transcript_retake_rows(pd.DataFrame(), transcript_data)
+        if pending_df.empty:
+            return build_empty_schedule(overlap), []
+    else:
+        pending_df = requirements_df.copy()
     latest_transcript_term = get_latest_transcript_term(transcript_data)
     latest_transcript_index = None if latest_transcript_term is None else (latest_transcript_term[0] * 4 + latest_transcript_term[1])
     future_term_mask = pd.Series(False, index=pending_df.index)
@@ -2867,10 +3156,9 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
             axis=1,
         )
 
-    pending_mask = (
-        pending_df["Audit Status"].isin(["Not Started", "In Progress"])
-        | future_term_mask
-    )
+    pending_mask = pending_df["Audit Status"].isin(
+        ["Not Started", "In Progress", "Registered", "Planned", "Attempted", "Retake Needed"]
+    ) | future_term_mask
     incomplete_mask = (pending_df["Requirement Complete"] != True) | future_term_mask
     pending_df = pending_df[incomplete_mask & pending_mask].copy()
     pending_df["Future Audit Snapshot"] = future_term_mask.reindex(pending_df.index, fill_value=False)
@@ -2881,14 +3169,14 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         | pending_df["Course ID"].isin(["LANG 104"])
         | (pending_df["Future Audit Snapshot"] == True)
     ].copy()
-    pending_df = pending_df[~pending_df["Course ID"].isin(transcript_data["taken_codes"])].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
     pending_df = lock_language_blocks_to_transcript_subject(pending_df, transcript_data)
     pending_df = drop_block_alternatives_covered_by_in_progress(pending_df, requirements_df, transcript_data)
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
+    pending_df = append_transcript_retake_rows(pending_df, transcript_data)
+    pending_df["Original Course ID"] = pending_df["Course ID"]
 
-    overlap = catalog_overlap_summary(catalog_df, transcript_data, audit_data)
     if pending_df.empty:
         return build_empty_schedule(overlap), []
 
@@ -2979,14 +3267,23 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df["Planning Bucket"] = pending_df["Recommended Term"].apply(planning_bucket)
     pending_df["Catalog Rank"] = pd.to_numeric(pending_df["Catalog Rank"], errors="coerce").fillna(999)
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
+    protected_mask = (
+        pending_df["Audit Status"].isin(["Retake Needed", "In Progress"])
+        | (pending_df["Recommended Term"] == "Current Term")
+        | pending_df["Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+        | pending_df["Original Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+        | (pending_df["Future Audit Snapshot"] == True)
+    )
     pending_df = pending_df[
         ~pending_df["Course ID"].isin(
             transcript_data["taken_codes"].union(transcript_data["in_progress_codes"])
         )
+        | protected_mask
     ].copy()
     if pending_df.empty:
         return build_empty_schedule(overlap), []
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    pending_df = collapse_language_requirement_options(pending_df, transcript_data)
     pending_df["Sequence Priority"] = pending_df["Course ID"].apply(
         lambda code: sequence_gap_priority(code, transcript_data)
     )
@@ -3074,17 +3371,28 @@ def should_attempt_remaining_recovery(
     audit_payload: dict,
     schedule_df: pd.DataFrame,
 ) -> bool:
-    if not schedule_df.empty:
-        return False
     if audit_payload.get("method") != "gemini_pdf":
         return False
     if float(transcript_data.get("total") or 0) >= 100:
         return False
+
+    if schedule_df.empty:
+        return True
+
+    suggested_credits = float(schedule_df["Credits"].sum()) if "Credits" in schedule_df.columns else 0.0
+    language_only = bool(
+        schedule_df.apply(is_primary_language_requirement_row, axis=1).all()
+    ) if not schedule_df.empty else False
+    if len(schedule_df) <= 2 or suggested_credits < 9 or language_only:
+        return True
+
     requirements_df = audit_data.get("requirements_df", pd.DataFrame())
     if requirements_df.empty:
-        return True
+        return False
     unique_codes = requirements_df["Course ID"].nunique() if "Course ID" in requirements_df.columns else 0
-    return len(requirements_df) < 8 or unique_codes < 5
+    if len(requirements_df) < 8 or unique_codes < 5:
+        return suggested_credits < 12 or len(schedule_df) < 4
+    return False
 
 
 def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
