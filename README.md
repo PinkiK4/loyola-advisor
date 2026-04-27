@@ -1,4 +1,4 @@
-# 🎓 Loyola Data Science Degree Advisor
+# 🎓 Loyola AI Degree Advisor
 **Author:** Krishon Pinkins  
 **Tools:** Python, Streamlit, PDFPlumber, Pandas
 
