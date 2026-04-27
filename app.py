@@ -74,6 +74,47 @@ def set_style(img_file: str) -> None:
             border-radius: 10px;
             margin-bottom: 12px;
         }}
+        .congrats-card {{
+            background: linear-gradient(135deg, rgba(0, 104, 56, 0.92), rgba(22, 42, 61, 0.94));
+            border: 1px solid rgba(232, 246, 238, 0.26);
+            border-left: 6px solid #d7b56d;
+            border-radius: 12px;
+            padding: 28px;
+            margin: 18px 0;
+            color: #f6fff9;
+            box-shadow: 0 18px 45px rgba(0, 0, 0, 0.28);
+        }}
+        .congrats-card h2 {{
+            margin: 0 0 10px 0;
+            font-size: 34px;
+            line-height: 1.15;
+        }}
+        .congrats-card p {{
+            margin: 0;
+            font-size: 18px;
+            line-height: 1.55;
+        }}
+        .congrats-stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px;
+            margin-top: 18px;
+        }}
+        .congrats-stat {{
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            border-radius: 8px;
+            padding: 12px;
+        }}
+        .congrats-stat b {{
+            display: block;
+            font-size: 24px;
+            margin-bottom: 3px;
+        }}
+        .congrats-stat span {{
+            color: rgba(246, 255, 249, 0.78);
+            font-size: 13px;
+        }}
         .footer {{
             position: fixed;
             left: 0;
@@ -128,7 +169,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-25 GroupProject relevant retakes v1"
+APP_BUILD = "2026-04-27 GroupProject completion screen v1"
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -222,10 +263,6 @@ def ocr_backend_status() -> dict:
         "gemini_key_available": bool(get_gemini_api_key()),
         "gemini_pdf_error": _GEMINI_EXTRACTION_ERROR or "",
     }
-
-
-def ocr_available() -> bool:
-    return pdfium is not None and get_ocr_engine() is not None
 
 
 def gemini_pdf_available() -> bool:
@@ -2487,6 +2524,34 @@ def drop_block_alternatives_covered_by_in_progress(
     ].copy()
 
 
+def filter_requirements_already_on_transcript(pending_df: pd.DataFrame, transcript_data: dict) -> pd.DataFrame:
+    if pending_df.empty or "Course ID" not in pending_df.columns:
+        return pending_df
+
+    covered_codes = set(transcript_data.get("taken_codes", set())) | set(transcript_data.get("in_progress_codes", set()))
+    if not covered_codes:
+        return pending_df
+
+    pending_df = pending_df.copy()
+    pending_df["_Transcript Covered"] = pending_df["Course ID"].isin(covered_codes)
+    covered_blocks = []
+    for requirement_block, group in pending_df.groupby("Requirement Block", dropna=False):
+        block_remaining = pd.to_numeric(group["Block Remaining"], errors="coerce").dropna()
+        if block_remaining.empty:
+            continue
+
+        remaining_needed = int(block_remaining.min())
+        transcript_covered_count = int(group["_Transcript Covered"].sum())
+        if remaining_needed > 0 and transcript_covered_count >= remaining_needed:
+            covered_blocks.append(requirement_block)
+
+    if covered_blocks:
+        pending_df = pending_df[~pending_df["Requirement Block"].isin(covered_blocks)].copy()
+
+    pending_df = pending_df[~pending_df["_Transcript Covered"]].copy()
+    return pending_df.drop(columns=["_Transcript Covered"])
+
+
 def get_ollama_status() -> dict:
     try:
         request = urllib.request.Request(f"{OLLAMA_URL}/api/tags", method="GET")
@@ -3170,10 +3235,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
         | (pending_df["Future Audit Snapshot"] == True)
     ].copy()
     pending_df = pending_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+    pending_df = pending_df[~pending_df["Course ID"].astype(str).str.endswith("W")].copy()
     pending_df = pending_df[pending_df.apply(row_matches_block_subject, axis=1)].copy()
     pending_df = lock_language_blocks_to_transcript_subject(pending_df, transcript_data)
     pending_df = drop_block_alternatives_covered_by_in_progress(pending_df, requirements_df, transcript_data)
     pending_df = apply_transcript_track_lock(pending_df, transcript_data)
+    pending_df = filter_requirements_already_on_transcript(pending_df, transcript_data)
     pending_df = append_transcript_retake_rows(pending_df, transcript_data)
     pending_df["Original Course ID"] = pending_df["Course ID"]
 
@@ -3427,6 +3494,37 @@ def create_pdf(student: dict, schedule_df: pd.DataFrame) -> bytes:
     return pdf.output(dest="S").encode("latin-1")
 
 
+def show_congratulations_screen(transcript_data: dict, audit_data: dict, message: str) -> None:
+    student_name = transcript_data["name"] if transcript_data["name"] != "Unknown Student" else "Student"
+    completed_count = len(transcript_data.get("taken_codes", set()))
+    in_progress_count = len(transcript_data.get("in_progress_codes", set()))
+    audit_requirement_count = len(audit_data["requirements_df"]) if not audit_data["requirements_df"].empty else 0
+
+    st.markdown(
+        f"""
+        <div class="congrats-card">
+            <h2>Congratulations, {student_name}!</h2>
+            <p>{message}</p>
+            <div class="congrats-stats">
+                <div class="congrats-stat">
+                    <b>{completed_count}</b>
+                    <span>completed transcript courses</span>
+                </div>
+                <div class="congrats-stat">
+                    <b>{in_progress_count}</b>
+                    <span>in-progress transcript courses</span>
+                </div>
+                <div class="congrats-stat">
+                    <b>{audit_requirement_count}</b>
+                    <span>audit requirement rows checked</span>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 with st.sidebar:
     st.header("Document Center")
     st.caption(f"Build: {APP_BUILD}")
@@ -3501,8 +3599,8 @@ if audit_file and transcript_file and catalog_files:
 
     transcript_data = parse_transcript(transcript_text)
     audit_data = parse_audit(audit_text) if audit_text_stats["usable"] else {"requirements_df": pd.DataFrame(), "audit_gpa": "N/A", "parser_method": "unusable"}
-    catalog_df = parse_catalogs(catalog_files or [])
-    program_profile = parse_program_profile(audit_text, catalog_files or [], transcript_data["major"])
+    catalog_df = parse_catalogs(catalog_files)
+    program_profile = parse_program_profile(audit_text, catalog_files, transcript_data["major"])
     ocr_status = ocr_backend_status()
     display_major = program_profile["display_label"]
     transcript_data["major"] = display_major
@@ -3572,16 +3670,7 @@ if audit_file and transcript_file and catalog_files:
             st.info("If you just installed requirements, fully stop and restart Streamlit so the OCR backend reloads.")
         elif completion_state["is_complete"]:
             st.subheader("Graduation Status")
-            st.success(completion_state["message"])
-            st.markdown(
-                f"""
-                <div class="info-card" style="background-color: rgba(32, 92, 54, 0.92); border-left: 5px solid #5dd67a;">
-                    <b>Congratulations, {transcript_data['name']}!</b><br>
-                    You have earned {transcript_data['total']} credits and your degree audit appears complete enough for graduation review.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            show_congratulations_screen(transcript_data, audit_data, completion_state["message"])
         elif schedule_df.empty:
             st.subheader("Recommended Schedule")
             if should_attempt_remaining_recovery(transcript_data, audit_data, audit_payload, schedule_df):
@@ -3589,7 +3678,11 @@ if audit_file and transcript_file and catalog_files:
                     "The audit text was extracted, but the remaining-requirements parse still came back too sparse to trust as a true zero-course result."
                 )
             else:
-                st.success("No remaining courses were detected from the audit.")
+                show_congratulations_screen(
+                    transcript_data,
+                    audit_data,
+                    "Your transcript already includes the remaining requirements found on the degree audit. No additional schedule recommendations are needed from this audit/transcript/catalog set.",
+                )
         else:
             st.subheader("Recommended Schedule")
             if audit_payload["method"] == "ocr":
