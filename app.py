@@ -737,6 +737,14 @@ def term_index(term_label: str):
     return year * 4 + season
 
 
+def display_recommended_term(term_label: str) -> str:
+    key = term_sort_key(str(term_label or ""))
+    if key is not None:
+        _, season = key
+        return "Next Spring" if season in {0, 1} else "Next Fall"
+    return "Next Spring" if str(term_label or "").strip() == "Current Term" else "Next Fall"
+
+
 def get_latest_transcript_term(transcript_data: dict):
     if transcript_data["courses_df"].empty:
         return None
@@ -1091,16 +1099,13 @@ def finalize_schedule_output(schedule_df: pd.DataFrame) -> pd.DataFrame:
     output_df = schedule_df[
         [
             "Recommended Term",
-            "Requirement Area",
-            "Requirement Block",
             "Course ID",
             "Course Name",
             "Credits",
             "Audit Status",
         ]
     ].reset_index(drop=True)
-    output_df["Requirement Area"] = output_df["Requirement Area"].apply(clean_requirement_area_label)
-    output_df["Requirement Block"] = output_df["Requirement Block"].apply(clean_requirement_block_label)
+    output_df["Recommended Term"] = output_df["Recommended Term"].apply(display_recommended_term)
     output_df["Course Name"] = output_df["Course Name"].apply(clean_course_title)
     output_df.attrs["catalog_overlap_count"] = schedule_df.attrs.get("catalog_overlap_count", 0)
     output_df.attrs["catalog_usable"] = schedule_df.attrs.get("catalog_usable", False)
