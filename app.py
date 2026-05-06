@@ -169,7 +169,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-APP_BUILD = "2026-04-27 GroupProject completion screen v1"
+APP_BUILD = "2026-05-06 Gemini primary privacy hardening v1"
+MAX_REMOTE_TEXT_CHARS = int(os.getenv("MAX_REMOTE_TEXT_CHARS", "30000"))
+MAX_REMOTE_ERROR_CHARS = 240
 NON_COMPLETION_GRADES = {"F", "W", "AU", "U"}
 IN_PROGRESS_GRADES = {"CIP", "IP"}
 OCR_MIN_SCORE = 0.35
@@ -199,6 +201,43 @@ CATALOG_DEFAULT_COLUMNS = {
     "Catalog Offering Notes": "",
     "Catalog Rank": pd.NA,
 }
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def remote_ai_data_allowed() -> bool:
+    return bool(st.session_state.get("remote_ai_data_consent")) or env_flag("ALLOW_REMOTE_AI_DATA")
+
+
+def remote_pdf_extraction_allowed() -> bool:
+    return bool(st.session_state.get("remote_pdf_extraction_consent")) or env_flag("ALLOW_REMOTE_PDF_EXTRACTION")
+
+
+def prefer_gemini_transcript_pdf() -> bool:
+    return bool(st.session_state.get("prefer_gemini_transcript_pdf")) or env_flag("PREFER_GEMINI_TRANSCRIPT_PDF")
+
+
+def limit_remote_text(text: str) -> str:
+    text = text or ""
+    return text[:MAX_REMOTE_TEXT_CHARS]
+
+
+def sanitize_external_error(message: str) -> str:
+    sanitized = str(message or "")
+    for secret in {
+        get_gemini_api_key(),
+        os.getenv("GEMINI_API_KEY", ""),
+        os.getenv("GOOGLE_API_KEY", ""),
+    }:
+        if secret:
+            sanitized = sanitized.replace(secret, "[redacted]")
+    sanitized = re.sub(r"key=([^&\s]+)", "key=[redacted]", sanitized, flags=re.I)
+    return sanitized[:MAX_REMOTE_ERROR_CHARS]
 
 
 def normalize_space(text: str) -> str:
@@ -266,7 +305,7 @@ def ocr_backend_status() -> dict:
 
 
 def gemini_pdf_available() -> bool:
-    return bool(get_gemini_api_key())
+    return bool(get_gemini_api_key()) and remote_ai_data_allowed() and remote_pdf_extraction_allowed()
 
 
 def extract_embedded_pdf_text(pdf_path: str) -> str:
@@ -283,6 +322,9 @@ def gemini_extract_pdf_text(pdf_path: str) -> str:
     api_key = get_gemini_api_key()
     if not api_key:
         _GEMINI_EXTRACTION_ERROR = "No Gemini API key is available for PDF fallback."
+        return ""
+    if not remote_ai_data_allowed() or not remote_pdf_extraction_allowed():
+        _GEMINI_EXTRACTION_ERROR = "Gemini PDF extraction is disabled until remote data and PDF extraction consent are enabled."
         return ""
 
     with open(pdf_path, "rb") as pdf_file:
@@ -342,11 +384,11 @@ def gemini_extract_pdf_text(pdf_path: str) -> str:
         text = "\n".join(part.get("text", "") for part in parts if part.get("text"))
         return soften_pdf_line_breaks(text)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+        detail = sanitize_external_error(exc.read().decode("utf-8", errors="replace"))
         _GEMINI_EXTRACTION_ERROR = f"HTTP {exc.code}: {detail}"
         return ""
     except Exception as exc:
-        _GEMINI_EXTRACTION_ERROR = f"{type(exc).__name__}: {exc}"
+        _GEMINI_EXTRACTION_ERROR = f"{type(exc).__name__}: {sanitize_external_error(str(exc))}"
         return ""
 
 
@@ -408,12 +450,25 @@ def ocr_pdf_text(pdf_path: str, ocr_engine=None) -> str:
     return "\n\n".join(pages)
 
 
-def extract_pdf_content(uploaded_file) -> dict:
+def extract_pdf_content(uploaded_file, prefer_gemini_pdf: bool = False) -> dict:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.getbuffer())
         temp_path = tmp.name
 
     try:
+        if prefer_gemini_pdf and gemini_pdf_available():
+            gemini_text = gemini_extract_pdf_text(temp_path)
+            gemini_stats = extracted_text_stats(gemini_text, min_lines=1, dense_char_threshold=120)
+            if gemini_stats["usable"]:
+                return {
+                    "text": gemini_text,
+                    "method": "gemini_pdf",
+                    "stats": gemini_stats,
+                    "embedded_stats": {"char_count": 0, "line_count": 0, "usable": False},
+                    "ocr_stats": {"char_count": 0, "line_count": 0, "usable": False},
+                    "gemini_stats": gemini_stats,
+                }
+
         embedded_text = extract_embedded_pdf_text(temp_path)
         embedded_stats = extracted_text_stats(embedded_text)
         if embedded_stats["usable"]:
@@ -2567,13 +2622,15 @@ def get_ollama_status() -> dict:
         return {
             "ok": False,
             "models": [],
-            "message": str(exc),
+            "message": sanitize_external_error(str(exc)),
         }
 
 
 def get_gemini_status() -> dict:
     if not get_gemini_api_key():
         return {"ok": False, "message": "Add a Gemini API key in the sidebar or environment."}
+    if not remote_ai_data_allowed():
+        return {"ok": False, "message": "Enable Gemini data processing consent before sending academic data."}
 
     return {"ok": True, "message": f"Ready to use {GEMINI_MODEL} via Gemini API."}
 
@@ -2610,6 +2667,8 @@ def call_gemini_json(model: str, system_prompt: str, user_payload: dict) -> dict
     api_key = get_gemini_api_key()
     if not api_key:
         raise RuntimeError("No Gemini API key is available.")
+    if not remote_ai_data_allowed():
+        raise RuntimeError("Gemini data processing consent is not enabled.")
 
     body = json.dumps(
         {
@@ -2651,14 +2710,14 @@ def call_gemini_json(model: str, system_prompt: str, user_payload: dict) -> dict
         text = "".join(part.get("text", "") for part in parts).strip()
         return json.loads(text)
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
+        detail = sanitize_external_error(exc.read().decode("utf-8", errors="replace"))
         raise RuntimeError(f"Gemini request failed: HTTP {exc.code}: {detail}") from exc
     except Exception as exc:
-        raise RuntimeError(f"Gemini request failed: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f"Gemini request failed: {type(exc).__name__}: {sanitize_external_error(str(exc))}") from exc
 
 
 def call_ai_json(system_prompt: str, user_payload: dict) -> dict:
-    provider = st.session_state.get("ai_provider", "ollama")
+    provider = st.session_state.get("ai_provider", "gemini")
     if provider == "gemini":
         return call_gemini_json(
             model=st.session_state.get("gemini_model", GEMINI_MODEL),
@@ -2761,7 +2820,7 @@ def parse_audit_with_gemini(text: str) -> dict:
                 "you may use course_id 'LANG 104' and course_name 'Intermediate II Language Course'."
             ),
             user_payload={
-                "audit_text": text[:45000],
+                "audit_text": limit_remote_text(text),
                 "output_schema": {
                     "audit_gpa": "string",
                     "rows": [
@@ -2820,7 +2879,7 @@ def parse_remaining_audit_with_gemini(text: str, transcript_data: dict, existing
             model=st.session_state.get("gemini_model", GEMINI_MODEL),
             system_prompt=system_prompt,
             user_payload={
-                "audit_text": text[:45000],
+                "audit_text": limit_remote_text(text),
                 "student_major": transcript_data.get("major", ""),
                 "earned_credits": transcript_data.get("total", 0),
                 "transcript_completed_courses": sorted(transcript_data.get("taken_codes", set())),
@@ -3035,7 +3094,7 @@ def refine_track_locks_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
 
     prompt = {
         "transcript_courses": transcript_data["courses_df"][
-            ["Course ID", "Course Name", "Grade", "Term"]
+            ["Course ID", "Course Name"]
         ].to_dict(orient="records"),
         "requirement_groups": candidate_groups,
         "output_schema": {
@@ -3105,9 +3164,7 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
         "student": {
             "major": transcript_data["major"],
             "program_profile": transcript_data.get("program_profile", {}),
-            "reference_context": transcript_data.get("reference_context", []),
             "earned_credits": transcript_data["total"],
-            "gpa": transcript_data["qpa"],
             "in_progress_courses": sorted(transcript_data["in_progress_codes"]),
             "completed_courses": sorted(transcript_data["taken_codes"]),
         },
@@ -3541,10 +3598,36 @@ with st.sidebar:
             key="gemini_api_key_input",
             help="Stored only for this Streamlit session unless you use environment variables or Streamlit secrets.",
         )
+        st.checkbox(
+            "Allow Gemini to process uploaded academic data",
+            value=env_flag("ALLOW_REMOTE_AI_DATA"),
+            key="remote_ai_data_consent",
+            help=(
+                "When enabled, minimized audit, transcript, catalog, and schedule data may be sent to the Gemini API. "
+                "Leave off to keep model reasoning local or disabled."
+            ),
+        )
+        st.checkbox(
+            "Allow Gemini to process full PDF files",
+            value=env_flag("ALLOW_REMOTE_PDF_EXTRACTION"),
+            key="remote_pdf_extraction_consent",
+            help=(
+                "Allows full PDF bytes to be sent to Gemini for text extraction. This is required for full transcript PDF mode."
+            ),
+        )
+        st.checkbox(
+            "Send full transcript PDF to Gemini first",
+            value=env_flag("PREFER_GEMINI_TRANSCRIPT_PDF", True),
+            key="prefer_gemini_transcript_pdf",
+            help=(
+                "Uses Gemini's PDF extraction on the complete transcript before local parsing. "
+                "Requires both Gemini data consent and full PDF processing consent."
+            ),
+        )
         if not get_gemini_api_key():
             st.warning(
                 "Add a Gemini API key here or in Streamlit secrets. "
-                "This deployment needs it for Gemini reasoning and PDF extraction fallback."
+                "Gemini is the primary model provider, but academic data is not sent until consent is enabled."
             )
     else:
         default_model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
@@ -3590,7 +3673,10 @@ st.title("Loyola AI Schedule Advisor")
 st.caption(f"Build: {APP_BUILD}")
 
 if audit_file and transcript_file and catalog_files:
-    transcript_payload = extract_pdf_content(transcript_file)
+    transcript_payload = extract_pdf_content(
+        transcript_file,
+        prefer_gemini_pdf=prefer_gemini_transcript_pdf(),
+    )
     audit_payload = extract_pdf_content(audit_file)
     transcript_text = transcript_payload["text"]
     audit_text = audit_payload["text"]
