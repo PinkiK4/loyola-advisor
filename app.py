@@ -1134,27 +1134,69 @@ def select_ai_candidate_window(pending_df: pd.DataFrame) -> pd.DataFrame:
         next_term_df = source_df.copy()
         next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
         next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
-        return next_term_df.head(6).copy()
+        return diversify_candidate_window(next_term_df, max_courses=10)
 
-    remaining_slots = max(0, 6 - len(current_term_df))
+    remaining_slots = max(0, 10 - len(current_term_df))
     source_df = non_future_df if not non_future_df.empty else pending_df
     next_term_df = source_df[source_df["Recommended Term"] != "Current Term"].copy()
     if not next_term_df.empty:
         next_term_df["Block Key"] = next_term_df["Requirement Block"].fillna(next_term_df["Course ID"])
         next_term_df = next_term_df.drop_duplicates(subset=["Block Key"]).drop(columns=["Block Key"])
-    next_term_df = next_term_df.head(remaining_slots).copy()
+    next_term_df = diversify_candidate_window(next_term_df, max_courses=remaining_slots)
     candidate_df = pd.concat([current_term_df, next_term_df], ignore_index=True)
     return candidate_df.drop_duplicates(subset=["Course ID", "Requirement Block"])
+
+
+def diversify_candidate_window(candidate_df: pd.DataFrame, max_courses: int = 10) -> pd.DataFrame:
+    if candidate_df.empty or max_courses <= 0:
+        return candidate_df.iloc[0:0].copy()
+
+    selected_indices = []
+    selected_course_ids = set()
+    subject_counts = {}
+
+    for subject_limit in (1, 2, 99):
+        for index, row in candidate_df.iterrows():
+            if len(selected_indices) >= max_courses:
+                break
+            course_id = str(row.get("Course ID", ""))
+            if course_id in selected_course_ids:
+                continue
+            subject = get_course_subject(course_id)
+            if subject and subject_counts.get(subject, 0) >= subject_limit:
+                continue
+            selected_indices.append(index)
+            selected_course_ids.add(course_id)
+            if subject:
+                subject_counts[subject] = subject_counts.get(subject, 0) + 1
+        if len(selected_indices) >= max_courses:
+            break
+
+    return candidate_df.loc[selected_indices].copy()
+
+
+def schedule_row_is_protected(row: pd.Series) -> bool:
+    return (
+        str(row.get("Recommended Term", "")) == "Current Term"
+        or str(row.get("Audit Status", "")) in {"Retake Needed", "In Progress"}
+        or bool(row.get("Future Audit Snapshot", False))
+    )
+
+
+def subject_limit_for_schedule(row: pd.Series) -> int:
+    return 99 if schedule_row_is_protected(row) else 2
 
 
 def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
     selected_rows = []
     running_credits = 0.0
     block_counts = {}
+    subject_counts = {}
     selected_course_ids = set()
     for _, row in pending_df.iterrows():
         credits = float(row["Credits"])
         course_id = str(row.get("Course ID", ""))
+        subject = get_course_subject(course_id)
         block_label = str(row.get("Requirement Block", ""))
         recommended_term = str(row.get("Recommended Term", ""))
         block_limit = row.get("Block Remaining", 1)
@@ -1168,12 +1210,16 @@ def select_ranked_schedule(pending_df: pd.DataFrame) -> pd.DataFrame:
             continue
         if recommended_term != "Current Term" and block_counts.get(block_label, 0) >= block_limit:
             continue
+        if subject and subject_counts.get(subject, 0) >= subject_limit_for_schedule(row):
+            continue
         if running_credits + credits > 15:
             continue
         selected_rows.append(row)
         running_credits += credits
         selected_course_ids.add(course_id)
         block_counts[block_label] = block_counts.get(block_label, 0) + 1
+        if subject:
+            subject_counts[subject] = subject_counts.get(subject, 0) + 1
         if running_credits >= 15:
             break
 
@@ -1199,6 +1245,11 @@ def extend_schedule_to_credit_target(
 
     selected_course_ids = set(selected_df["Course ID"].tolist())
     block_counts = selected_df.groupby("Requirement Block").size().to_dict()
+    subject_counts = {}
+    for course_id in selected_course_ids:
+        subject = get_course_subject(course_id)
+        if subject:
+            subject_counts[subject] = subject_counts.get(subject, 0) + 1
     extra_rows = []
 
     candidate_df = source_df.copy()
@@ -1218,32 +1269,44 @@ def extend_schedule_to_credit_target(
         ascending=[True, True, True, True, True, True, True, True, True],
     )
 
-    for _, row in candidate_df.iterrows():
+    for enforce_subject_variety in (True, False):
+        for _, row in candidate_df.iterrows():
+            if running_credits >= min_credits:
+                break
+
+            course_id = str(row.get("Course ID", ""))
+            subject = get_course_subject(course_id)
+            block_label = str(row.get("Requirement Block", ""))
+            if course_id in selected_course_ids:
+                continue
+
+            credits = float(row["Credits"])
+            if running_credits + credits > max_credits:
+                continue
+
+            block_limit = row.get("Block Remaining", 1)
+            try:
+                block_limit = int(block_limit) if pd.notna(block_limit) else 1
+            except Exception:
+                block_limit = 1
+            block_limit = max(block_limit, 1)
+            if block_counts.get(block_label, 0) >= block_limit:
+                continue
+            if (
+                enforce_subject_variety
+                and subject
+                and subject_counts.get(subject, 0) >= subject_limit_for_schedule(row)
+            ):
+                continue
+
+            extra_rows.append(row)
+            selected_course_ids.add(course_id)
+            block_counts[block_label] = block_counts.get(block_label, 0) + 1
+            if subject:
+                subject_counts[subject] = subject_counts.get(subject, 0) + 1
+            running_credits += credits
         if running_credits >= min_credits:
             break
-
-        course_id = str(row.get("Course ID", ""))
-        block_label = str(row.get("Requirement Block", ""))
-        if course_id in selected_course_ids:
-            continue
-
-        credits = float(row["Credits"])
-        if running_credits + credits > max_credits:
-            continue
-
-        block_limit = row.get("Block Remaining", 1)
-        try:
-            block_limit = int(block_limit) if pd.notna(block_limit) else 1
-        except Exception:
-            block_limit = 1
-        block_limit = max(block_limit, 1)
-        if block_counts.get(block_label, 0) >= block_limit:
-            continue
-
-        extra_rows.append(row)
-        selected_course_ids.add(course_id)
-        block_counts[block_label] = block_counts.get(block_label, 0) + 1
-        running_credits += credits
 
     if not extra_rows:
         return selected_df.reset_index(drop=True)
@@ -3183,7 +3246,9 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
             "Keep the total as close to 15 credits as possible without going over, unless fewer than 4 valid courses exist. "
             "Prefer in-progress courses first, prefer coherent subject sequences already started by the student, "
             "and treat any candidate with Audit Status = Retake Needed as a high-priority repeat unless stronger current-term obligations already fill the load. "
-            "and avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
+            "Avoid selecting more than two courses with the same subject prefix unless they are required current-term, in-progress, or retake courses. "
+            "When several valid candidates are similarly strong, choose a schedule with more varied subject prefixes across major, core, elective, and support areas. "
+            "Avoid mixing alternate tracks inside the same requirement block unless there is strong evidence that both belong. "
             "If the student has multiple majors, specializations, or minors, preserve a balanced forward path across those programs without double-counting overlapping courses. "
             "When a candidate has Future Audit Snapshot = true, treat it as a reopened requirement from a newer audit snapshot, not as already fulfilled. "
             "Respect catalog prerequisite, co-requisite, restriction, and offering-note hints whenever they are present. "
@@ -3211,15 +3276,26 @@ def optimize_schedule_with_ai(pending_df: pd.DataFrame, transcript_data: dict):
 
     running_credits = 0.0
     kept_rows = []
+    subject_counts = {}
     for _, row in selected_df.iterrows():
         credits = float(row["Credits"])
+        course_id = str(row.get("Course ID", ""))
+        subject = get_course_subject(course_id)
         if (
-            row["Course ID"] not in required_current_ids
+            course_id not in required_current_ids
+            and subject
+            and subject_counts.get(subject, 0) >= subject_limit_for_schedule(row)
+        ):
+            continue
+        if (
+            course_id not in required_current_ids
             and running_credits + credits > 15
         ):
             continue
         kept_rows.append(row)
         running_credits += credits
+        if subject:
+            subject_counts[subject] = subject_counts.get(subject, 0) + 1
 
     kept_df = pd.DataFrame(kept_rows)
     if kept_df.empty:
@@ -3446,12 +3522,12 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     if use_ai:
         try:
             if provider == "gemini":
-                ai_candidate_df = select_ai_candidate_window(ranked_schedule_df)
+                ai_candidate_df = select_ai_candidate_window(pending_df)
                 optimized_df, schedule_notes = optimize_schedule_with_ai(ai_candidate_df, transcript_data)
                 if ai_schedule_is_valid(ai_candidate_df, optimized_df):
                     pending_df = extend_schedule_to_credit_target(
                         optimized_df,
-                        ranked_schedule_df,
+                        pending_df,
                         min_credits=12.0,
                         max_credits=15.0,
                     )
