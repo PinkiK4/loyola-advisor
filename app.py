@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -238,6 +239,15 @@ def sanitize_external_error(message: str) -> str:
             sanitized = sanitized.replace(secret, "[redacted]")
     sanitized = re.sub(r"key=([^&\s]+)", "key=[redacted]", sanitized, flags=re.I)
     return sanitized[:MAX_REMOTE_ERROR_CHARS]
+
+
+def friendly_ai_error(exc: Exception) -> str:
+    message = str(exc)
+    if "HTTP 503" in message or "UNAVAILABLE" in message or "high demand" in message:
+        return "Gemini is temporarily busy, so deterministic scheduling was used this run."
+    if "HTTP 429" in message or "RESOURCE_EXHAUSTED" in message or "rate" in message.lower():
+        return "Gemini rate limits were reached, so deterministic scheduling was used this run."
+    return f"AI reasoning fallback used: {sanitize_external_error(message)}"
 
 
 def normalize_space(text: str) -> str:
@@ -2783,18 +2793,25 @@ def call_gemini_json(model: str, system_prompt: str, user_payload: dict) -> dict
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        candidate = (payload.get("candidates") or [{}])[0]
-        parts = candidate.get("content", {}).get("parts", [])
-        text = "".join(part.get("text", "") for part in parts).strip()
-        return json.loads(text)
-    except urllib.error.HTTPError as exc:
-        detail = sanitize_external_error(exc.read().decode("utf-8", errors="replace"))
-        raise RuntimeError(f"Gemini request failed: HTTP {exc.code}: {detail}") from exc
-    except Exception as exc:
-        raise RuntimeError(f"Gemini request failed: {type(exc).__name__}: {sanitize_external_error(str(exc))}") from exc
+    last_error = None
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            candidate = (payload.get("candidates") or [{}])[0]
+            parts = candidate.get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts).strip()
+            return json.loads(text)
+        except urllib.error.HTTPError as exc:
+            detail = sanitize_external_error(exc.read().decode("utf-8", errors="replace"))
+            last_error = RuntimeError(f"Gemini request failed: HTTP {exc.code}: {detail}")
+            if exc.code not in {429, 500, 502, 503, 504} or attempt == 3:
+                raise last_error from exc
+            time.sleep(2**attempt)
+        except Exception as exc:
+            raise RuntimeError(f"Gemini request failed: {type(exc).__name__}: {sanitize_external_error(str(exc))}") from exc
+
+    raise last_error or RuntimeError("Gemini request failed after retries.")
 
 
 def call_ai_json(system_prompt: str, user_payload: dict) -> dict:
@@ -3567,7 +3584,7 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
                     pending_df = optimized_df
                     ai_notes.extend(schedule_notes)
         except Exception as exc:
-            warning_message = f"AI reasoning fallback used: {exc}"
+            warning_message = friendly_ai_error(exc)
             st.warning(warning_message)
             ai_notes.append({"reason": warning_message})
             pending_df = ranked_schedule_df
