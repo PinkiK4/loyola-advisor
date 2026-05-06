@@ -1431,6 +1431,19 @@ def uploaded_pdf_text(uploaded_file) -> str:
     return extract_pdf_content(uploaded_file)["text"]
 
 
+def clean_student_name(raw_name: str) -> str:
+    cleaned = normalize_space(str(raw_name or ""))
+    cleaned = re.split(
+        r"\s+(?:S\.?S\.?No\.?|I\.?D\.?No\.?|Student ID|SID|Level|Major|Unofficial)\s*:",
+        cleaned,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    cleaned = re.sub(r"\s+LOYOLA UNIVERSITY MARYLAND.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^(?:Name|Student)\s*:\s*", "", cleaned, flags=re.I)
+    return normalize_space(cleaned) or "Unknown Student"
+
+
 def parse_transcript(text: str) -> dict:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -1445,7 +1458,7 @@ def parse_transcript(text: str) -> dict:
 
     header_name_match = re.search(r"Name:\s*(.+?)\s+LOYOLA UNIVERSITY MARYLAND", text, re.I)
     if header_name_match:
-        name = normalize_space(header_name_match.group(1))
+        name = clean_student_name(header_name_match.group(1))
 
     header_sid_match = re.search(r"I\.D\.No\.:\s*(\d{5,10})", text, re.I)
     if header_sid_match:
@@ -1457,7 +1470,7 @@ def parse_transcript(text: str) -> dict:
 
         if line.startswith("Name:"):
             cleaned = re.sub(r"\s+LOYOLA UNIVERSITY MARYLAND.*", "", line)
-            name = cleaned.replace("Name:", "", 1).strip() or name
+            name = clean_student_name(cleaned) or name
 
         sid_match = re.search(r"(?:I\.D\.No\.|Student ID|ID|SID):\s*(\d{5,10})", line, re.I)
         if sid_match:
@@ -1535,7 +1548,7 @@ def parse_transcript(text: str) -> dict:
     progression_codes = completed_codes | in_progress_codes
 
     return {
-        "name": name,
+        "name": clean_student_name(name),
         "sid": sid,
         "major": major,
         "qpa": gpa,
