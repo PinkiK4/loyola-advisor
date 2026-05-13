@@ -2023,6 +2023,24 @@ def apply_catalog_fallback_metadata(entries: OrderedDict) -> None:
                 value["Catalog Rank"] = level_based_catalog_rank(value["Course ID"])
 
 
+def add_catalog_prereq(entries: OrderedDict, course_id: str, prereq_id: str) -> None:
+    if course_id not in entries or prereq_id not in entries:
+        return
+    prereqs = entries[course_id]["Catalog Prereqs"]
+    if prereq_id not in prereqs:
+        prereqs.append(prereq_id)
+
+
+def apply_catalog_sequence_prerequisites(entries: OrderedDict) -> None:
+    # The Data Science catalogue's four-year plan places ST 310 before ST 465,
+    # but the printable PDF does not repeat that sequencing as a "Prerequisite:" line.
+    # Preserve that academic order so next-term recommendations do not skip ST 310.
+    st_310_rank = entries.get("ST 310", {}).get("Catalog Rank")
+    st_465_rank = entries.get("ST 465", {}).get("Catalog Rank")
+    if st_310_rank is not None and st_465_rank is not None and st_310_rank < st_465_rank:
+        add_catalog_prereq(entries, "ST 465", "ST 310")
+
+
 def parse_catalog_notes(text: str) -> dict:
     notes_by_course: dict[str, dict[str, list[str]]] = {}
 
@@ -2207,6 +2225,7 @@ def parse_catalogs(catalog_files) -> pd.DataFrame:
         return pd.DataFrame()
 
     apply_catalog_fallback_metadata(entries)
+    apply_catalog_sequence_prerequisites(entries)
 
     catalog_rows = []
     for value in entries.values():
@@ -3502,6 +3521,20 @@ def build_schedule(transcript_data: dict, audit_data: dict, catalog_df: pd.DataF
     pending_df["Planning Bucket"] = pending_df["Recommended Term"].apply(planning_bucket)
     pending_df["Catalog Rank"] = pd.to_numeric(pending_df["Catalog Rank"], errors="coerce").fillna(999)
     pending_df = pending_df.apply(lambda row: infer_sequenced_course(row, transcript_data), axis=1)
+    protected_mask = (
+        pending_df["Audit Status"].isin(["Retake Needed", "In Progress"])
+        | (pending_df["Recommended Term"] == "Current Term")
+        | pending_df["Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+        | pending_df["Original Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+        | (pending_df["Future Audit Snapshot"] == True)
+    )
+    prereq_protected_mask = (
+        pending_df["Audit Status"].isin(["Retake Needed", "In Progress"])
+        | (pending_df["Recommended Term"] == "Current Term")
+        | pending_df["Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+        | pending_df["Original Course ID"].isin(transcript_data.get("not_passed_codes", set()))
+    )
+    pending_df = pending_df[pending_df["Catalog Prereq Ready"] | prereq_protected_mask].copy()
     protected_mask = (
         pending_df["Audit Status"].isin(["Retake Needed", "In Progress"])
         | (pending_df["Recommended Term"] == "Current Term")
